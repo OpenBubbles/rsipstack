@@ -185,6 +185,8 @@ impl std::fmt::Display for TransactionType {
 /// * `TimerF` - Transaction timeout timer for non-INVITE server transactions
 /// * `TimerK` - Wait timer for ACK (server INVITE transactions)
 /// * `TimerG` - Retransmission timer for INVITE server transactions
+/// * `TimerRel1xx` - Retransmission timer for reliable provisional responses (RFC 3262)
+/// * `TimerRel1xxTimeout` - 64*T1 PRACK timeout for reliable provisional responses (RFC 3262)
 /// * `TimerCleanup` - Internal cleanup timer for transaction removal
 ///
 /// # Timer Values (RFC 3261)
@@ -201,6 +203,10 @@ impl std::fmt::Display for TransactionType {
 /// * Timer F: 64*T1 (32 seconds)
 /// * Timer G: starts at T1, doubles up to T2
 /// * Timer K: T4 for unreliable, 0 for reliable transports
+/// * TimerRel1xx: starts at T1, doubles without cap (RFC 3262 §3); only armed on
+///   unreliable transports (a deliberate deviation from RFC 3262, which retransmits
+///   end-to-end regardless of the first-hop transport)
+/// * TimerRel1xxTimeout: 64*T1 on all transports (RFC 3262 §3)
 ///
 /// # Examples
 ///
@@ -245,6 +251,7 @@ impl std::fmt::Display for TransactionType {
 /// * Cancelled when leaving states or receiving responses
 /// * Fire events that drive state machine transitions
 /// * Handle retransmissions and timeouts
+#[derive(Debug, Clone, PartialEq)]
 pub enum TransactionTimer {
     TimerA(TransactionKey, Duration),
     TimerB(TransactionKey),
@@ -252,6 +259,24 @@ pub enum TransactionTimer {
     TimerD(TransactionKey),
     TimerK(TransactionKey),
     TimerG(TransactionKey, Duration),
+    /// RFC 3262 §3 retransmission timer for the unacknowledged reliable
+    /// provisional response with the given RSeq. The interval starts at T1 and
+    /// doubles on every firing (no T2 cap — the 64*T1 timeout bounds it).
+    ///
+    /// Only armed when the transport is unreliable (UDP). This is a deliberate
+    /// deviation from RFC 3262, which retransmits end-to-end on all transports;
+    /// [`TransactionTimer::TimerRel1xxTimeout`] still runs on every transport.
+    ///
+    /// The RSeq is carried so that a timer event that was already queued when
+    /// the response was acknowledged (or superseded) is recognised as stale and
+    /// ignored.
+    TimerRel1xx(TransactionKey, u32, Duration),
+    /// RFC 3262 §3 64*T1 PRACK timeout for the unacknowledged reliable
+    /// provisional response with the given RSeq. On expiry the server INVITE
+    /// transaction rejects the INVITE with `500 Server Internal Error` and
+    /// surfaces that response to the transaction user via
+    /// [`Transaction::receive`].
+    TimerRel1xxTimeout(TransactionKey, u32),
     TimerCleanup(TransactionKey),
 }
 
@@ -264,6 +289,8 @@ impl TransactionTimer {
             TransactionTimer::TimerD(key) => key,
             TransactionTimer::TimerG(key, _) => key,
             TransactionTimer::TimerK(key) => key,
+            TransactionTimer::TimerRel1xx(key, _, _) => key,
+            TransactionTimer::TimerRel1xxTimeout(key, _) => key,
             TransactionTimer::TimerCleanup(key) => key,
         }
     }
@@ -282,6 +309,12 @@ impl std::fmt::Display for TransactionTimer {
                 write!(f, "TimerG: {} {}", key, duration.as_millis())
             }
             TransactionTimer::TimerK(key) => write!(f, "TimerK: {}", key),
+            TransactionTimer::TimerRel1xx(key, rseq, duration) => {
+                write!(f, "TimerRel1xx: {} {} {}", key, rseq, duration.as_millis())
+            }
+            TransactionTimer::TimerRel1xxTimeout(key, rseq) => {
+                write!(f, "TimerRel1xxTimeout: {} {}", key, rseq)
+            }
             TransactionTimer::TimerCleanup(key) => write!(f, "TimerCleanup: {}", key),
         }
     }
@@ -302,6 +335,23 @@ pub fn make_call_id(domain: Option<&str>) -> crate::sip::headers::CallId {
 
 pub fn make_tag() -> crate::sip::param::Tag {
     random_text(TO_TAG_LEN).into()
+}
+
+/// First `RSeq` assigned to a reliable provisional response (RFC 3262 §3).
+///
+/// RFC 3262 only requires the initial RSeq to lie in `1..=2^31-1` and merely
+/// RECOMMENDS a random start; this crate deliberately starts every INVITE
+/// transaction at `1` and increments by exactly one per reliable provisional
+/// response (never wrapping — see the `checked_add` paths in the transaction
+/// and dialog layers). A deterministic start keeps the sequence predictable
+/// for applications that track it and for tests.
+pub const INITIAL_RSEQ: u32 = 1;
+
+/// Initial `RSeq` value for a reliable provisional response: always
+/// [`INITIAL_RSEQ`] (1). Kept as a function for call sites that lazily seed a
+/// per-transaction counter; it never returns a random value.
+pub fn make_rseq() -> u32 {
+    INITIAL_RSEQ
 }
 
 #[cfg(not(target_family = "wasm"))]

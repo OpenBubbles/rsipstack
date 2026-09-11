@@ -10,7 +10,18 @@ A RFC 3261/3262 compliant SIP stack written in Rust. The goal of this project is
 - **Multiple Transport Support**: UDP, TCP, TLS, WebSocket (TLS/WebSocket require the `rustls` and `websocket` features, enabled by default)
 - **Transaction Layer**: Complete SIP transaction state machine
 - **Dialog Layer**: SIP dialog management
-- **Reliable Provisionals**: PRACK (RFC 3262 / 100rel) support
+- **Reliable Provisionals**: native RFC 3262 / 100rel support on both sides. As a UAS the dialog layer
+  sends a provisional response reliably when the application includes `Require: 100rel` in the headers
+  passed to `ringing()` (and the UAC advertised `100rel`): the library generates and tracks `RSeq`
+  (sequential, starting at `1` per INVITE; application-supplied `RSeq` headers are ignored),
+  retransmits the response over UDP (interval starting at T1 and doubling), runs the 64*T1 PRACK timeout
+  on every transport (rejecting the INVITE with `500` and terminating the dialog with
+  `TerminatedReason::PrackTimeout`), serializes reliable provisionals, holds a 2xx behind an
+  unacknowledged provisional that carried a body, and answers PRACK with `200` / `481` / `400`.
+  Deliberate deviations from RFC 3262: retransmission only happens on unreliable transports (the
+  first hop is trusted on TCP/TLS/WS), and the UAC's own `Require: 100rel` never forces reliability —
+  the application's header is the only switch; rejecting with `420` + `Unsupported: 100rel` when
+  unwilling is the application's job. Not covered: 100rel on re-INVITEs and offer/answer in PRACK bodies.
 - **Digest Authentication**: Built-in authentication support
 - **High Performance**: Built with Rust for maximum performance
 - **Easy to Use**: Simple and intuitive API design

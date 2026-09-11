@@ -9,6 +9,7 @@ mod test_before_send;
 mod test_client;
 mod test_endpoint;
 mod test_provisional_responses;
+mod test_reliable_provisional;
 mod test_server;
 mod test_server_invite_drop;
 mod test_transaction_states;

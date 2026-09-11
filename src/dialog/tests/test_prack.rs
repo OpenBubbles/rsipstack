@@ -89,13 +89,15 @@ async fn server_dialog_handles_prack_request() -> crate::Result<()> {
 
     server_dialog.handle(&mut tx).await?;
 
+    // RFC 3262 §3: a PRACK that matches no unacknowledged reliable provisional
+    // response (no `ringing()` was sent) is answered with 481.
     let event = timeout(Duration::from_secs(1), transport_rx.recv())
         .await
         .expect("timeout waiting for PRACK response")
         .expect("transport event");
     match event {
         TransportEvent::Incoming(SipMessage::Response(resp), _, _) => {
-            assert_eq!(resp.status_code, StatusCode::OK);
+            assert_eq!(resp.status_code, StatusCode::CallTransactionDoesNotExist);
         }
         other => panic!("unexpected transport event: {other:?}"),
     }

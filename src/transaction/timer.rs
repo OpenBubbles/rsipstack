@@ -78,6 +78,22 @@ impl<T> Timer<T> {
         task_id
     }
 
+    /// Return a copy of the value scheduled under `task_id`, if it is still
+    /// pending (test helper; no behaviour change).
+    #[cfg(test)]
+    pub(crate) fn peek(&self, task_id: u64) -> Option<T>
+    where
+        T: Clone,
+    {
+        let state = self.lock_state();
+        let execute_at = *state.id_to_tasks.get(&task_id)?;
+        let key = TimerKey {
+            task_id,
+            execute_at,
+        };
+        state.tasks.get(&key).cloned()
+    }
+
     pub fn cancel(&self, task_id: u64) -> Option<T> {
         let mut state = self.lock_state();
         let execute_at = state.id_to_tasks.remove(&task_id)?;

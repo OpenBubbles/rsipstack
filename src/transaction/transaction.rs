@@ -7,9 +7,10 @@ use crate::sip::{
     StatusCode, StatusCodeKind,
 };
 use crate::transaction::key::TransactionRole;
-use crate::transaction::make_tag;
+use crate::transaction::{make_tag, INITIAL_RSEQ};
 use crate::transport::SipAddr;
 use crate::{Error, Result};
+use std::collections::VecDeque;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, trace, warn};
 
@@ -161,6 +162,29 @@ pub fn transaction_event_sender_noop() -> TransactionEventSender {
 /// * Timer F: Non-INVITE transaction timeout
 /// * Timer G: INVITE response retransmission timer
 /// * Timer K: Wait time for ACK
+///
+/// # Reliable Provisional Responses (RFC 3262)
+///
+/// A server INVITE transaction natively handles reliable provisional
+/// responses. A `101`-`199` response handed to [`Transaction::respond`] that
+/// carries `Require: 100rel` is sent reliably: the transaction assigns an
+/// `RSeq` starting at [`INITIAL_RSEQ`] (1) and incrementing by one (a supplied
+/// RSeq is honoured only for the first reliable provisional response of the
+/// transaction; afterwards the transaction's own counter wins), retransmits it
+/// on unreliable transports with an interval starting at T1 and doubling, runs
+/// a 64*T1 PRACK timeout on every transport, serializes reliable provisionals
+/// (a second one is queued until the first is PRACKed), and holds a 2xx while
+/// an unacknowledged reliable provisional carried a body. A matching PRACK is
+/// fed to the transaction as `TransactionEvent::Received` (the dialog layer
+/// does this); on timeout the INVITE is rejected with `500 Server Internal
+/// Error` and that response is returned from [`Transaction::receive`].
+///
+/// Only the initial (dialog-creating) INVITE is covered: when the INVITE's To
+/// header already carries a tag (re-INVITE) the `100rel` headers are stripped
+/// with a warning and the response is sent unreliably. Likewise, when the
+/// INVITE advertised neither `Supported: 100rel` nor `Require: 100rel` the
+/// provisional response is downgraded to an unreliable one (RFC 3262 §3 MUST
+/// NOT).
 pub struct Transaction {
     pub transaction_type: TransactionType,
     pub key: TransactionKey,
@@ -181,6 +205,145 @@ pub struct Transaction {
     pub timer_g: Option<u64>, // server invite only
     retransmission: bool,
     is_cleaned_up: bool,
+    /// Next RSeq to assign to a reliable provisional response (RFC 3262 §3).
+    /// Initialized lazily from [`INITIAL_RSEQ`] (1), or from the value the
+    /// dialog layer put on the first reliable provisional response. Once set,
+    /// the transaction is authoritative: a supplied RSeq that is not the
+    /// expected next value is replaced (RSeq must increase by exactly one per
+    /// transaction, and the stale-timer guards rely on every reliable
+    /// provisional carrying a distinct RSeq).
+    rel1xx_next_rseq: Option<u32>,
+    /// The reliable provisional response currently on the wire and not yet
+    /// acknowledged by a matching PRACK.
+    rel1xx_unacked: Option<ReliableProvisional>,
+    /// Responses held back while `rel1xx_unacked` is outstanding: further
+    /// reliable provisional responses (RFC 3262 §3: one at a time) and a 2xx
+    /// that must wait for a body-carrying provisional to be acknowledged.
+    rel1xx_pending: VecDeque<Response>,
+    timer_rel1xx: Option<u64>,
+    timer_rel1xx_timeout: Option<u64>,
+    /// To tag of the first non-100 response sent by this server INVITE
+    /// transaction; reused for every later locally generated response (487
+    /// after CANCEL, the RFC 3262 timeout 500) so they all belong to the same
+    /// early dialog.
+    local_to_tag: Option<String>,
+}
+
+/// A reliable provisional response (RFC 3262) that has been sent but not yet
+/// acknowledged by a matching PRACK.
+struct ReliableProvisional {
+    /// The response as handed to `respond()` (before the message inspector).
+    response: Response,
+    rseq: u32,
+    cseq: u32,
+    method: Method,
+    /// Whether the response carried a body. RFC 3262 §3 only requires a 2xx to
+    /// be held behind provisional responses that carried a *session
+    /// description*; holding behind any body is a conservative superset.
+    has_body: bool,
+    call_id: String,
+    from_tag: Option<String>,
+    to_tag: Option<String>,
+}
+
+impl ReliableProvisional {
+    /// RFC 3262 §3: a matching PRACK is one within the same dialog as the
+    /// response whose RAck matches the response's RSeq and CSeq.
+    fn matches_prack(&self, prack: &Request) -> bool {
+        let Some((rseq, cseq, method)) = prack.rack_value() else {
+            return false;
+        };
+        if rseq != self.rseq || cseq != self.cseq || method != self.method {
+            return false;
+        }
+        let call_id = prack.call_id_header().map(|h| h.value().to_string()).ok();
+        let from_tag = prack
+            .from_header()
+            .ok()
+            .and_then(|h| h.tag().ok().flatten())
+            .map(|t| t.value().to_string());
+        let to_tag = prack
+            .to_header()
+            .ok()
+            .and_then(|h| h.tag().ok().flatten())
+            .map(|t| t.value().to_string());
+        call_id.as_deref() == Some(self.call_id.as_str())
+            && from_tag == self.from_tag
+            && to_tag == self.to_tag
+    }
+}
+
+fn is_rseq_header(h: &Header) -> bool {
+    match h {
+        Header::RSeq(_) => true,
+        Header::Other(name, _) if name.eq_ignore_ascii_case("RSeq") => true,
+        _ => false,
+    }
+}
+
+/// Remove every `RSeq` header (typed or untyped). Returns whether one was removed.
+pub(crate) fn remove_rseq_headers(headers: &mut Vec<Header>) -> bool {
+    let before = headers.len();
+    headers.retain(|h| !is_rseq_header(h));
+    headers.len() != before
+}
+
+/// `value` without the comma-separated `token` (case-insensitive), or `None`
+/// when the token is not present. The remaining pieces are kept verbatim —
+/// only the removed token and the resulting stray separator go away — so the
+/// application's own spacing is preserved.
+fn without_token(value: &str, token: &str) -> Option<String> {
+    if !value.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)) {
+        return None;
+    }
+    let kept: Vec<&str> = value
+        .split(',')
+        .filter(|t| !t.trim().eq_ignore_ascii_case(token))
+        .collect();
+    Some(kept.join(",").trim().to_string())
+}
+
+/// Remove `token` from every `Require` header (typed or untyped), dropping a
+/// header that becomes empty. Headers are never reformatted: the remaining
+/// tokens keep their original text and separators. Returns whether anything
+/// was removed.
+pub(crate) fn strip_require_token(headers: &mut Vec<Header>, token: &str) -> bool {
+    let mut removed = false;
+    let mut out = Vec::with_capacity(headers.len());
+    for header in headers.drain(..) {
+        let rewritten = match &header {
+            Header::Require(v) => without_token(v.value(), token).map(|nv| {
+                let empty = nv.is_empty();
+                (empty, Header::Require(nv.into()))
+            }),
+            Header::Other(name, v) if name.eq_ignore_ascii_case("Require") => {
+                without_token(v, token).map(|nv| {
+                    let empty = nv.is_empty();
+                    (empty, Header::Other(name.clone(), nv))
+                })
+            }
+            _ => None,
+        };
+        match rewritten {
+            Some((true, _)) => removed = true,
+            Some((false, h)) => {
+                removed = true;
+                out.push(h);
+            }
+            None => out.push(header),
+        }
+    }
+    *headers = out;
+    removed
+}
+
+/// Remove the `100rel` option tag from every `Require` header (dropping the
+/// header when it becomes empty) and remove every `RSeq` header, without
+/// reformatting anything else. Returns whether anything was removed.
+fn strip_reliable_headers(response: &mut Response) -> bool {
+    let removed_rseq = remove_rseq_headers(&mut response.headers.0);
+    let removed_token = strip_require_token(&mut response.headers.0, "100rel");
+    removed_rseq || removed_token
 }
 
 impl Transaction {
@@ -221,6 +384,12 @@ impl Transaction {
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
+            rel1xx_next_rseq: None,
+            rel1xx_unacked: None,
+            rel1xx_pending: VecDeque::new(),
+            timer_rel1xx: None,
+            timer_rel1xx_timeout: None,
+            local_to_tag: None,
         };
         tx.endpoint_inner
             .attach_transaction(&tx.key, tx.tu_sender.clone());
@@ -364,9 +533,16 @@ impl Transaction {
             _ => {
                 let to = self.original.to_header()?;
                 if to.tag()?.is_none() {
+                    // Reuse the tag already sent on a provisional response (e.g. a
+                    // reliable 183) so the final belongs to the same early dialog.
+                    let tag = self
+                        .local_to_tag
+                        .clone()
+                        .map(Into::into)
+                        .unwrap_or_else(make_tag);
                     self.original
                         .headers
-                        .unique_push(to.clone().with_tag(make_tag()).into());
+                        .unique_push(to.clone().with_tag(tag).into());
                 }
             }
         }
@@ -380,18 +556,131 @@ impl Transaction {
     pub async fn reply(&mut self, status_code: StatusCode) -> Result<()> {
         self.reply_with(status_code, vec![], None).await
     }
-    // send server response
+    /// Send a server response.
+    ///
+    /// For server INVITE transactions this is RFC 3262 aware — see the
+    /// "Reliable Provisional Responses" section of [`Transaction`]. A reliable
+    /// provisional response or a 2xx may be *queued* rather than sent; in that
+    /// case `Ok(())` is returned and the response goes out once the outstanding
+    /// reliable provisional response is acknowledged.
     pub async fn respond(&mut self, response: Response) -> Result<()> {
         match self.transaction_type {
-            TransactionType::ServerInvite | TransactionType::ServerNonInvite => {}
+            TransactionType::ServerInvite => self.respond_invite(response).await,
+            TransactionType::ServerNonInvite => self.respond_plain(response).await,
+            _ => Err(Error::TransactionError(
+                "respond is only valid for server transactions".to_string(),
+                self.key.clone(),
+            )),
+        }
+    }
+
+    /// RFC 3262 aware response path for server INVITE transactions.
+    async fn respond_invite(&mut self, mut response: Response) -> Result<()> {
+        match response.status_code.kind() {
+            StatusCodeKind::Provisional => {
+                if response.status_code == StatusCode::Trying {
+                    if strip_reliable_headers(&mut response) {
+                        warn!(
+                            key = %self.key,
+                            "100 Trying is never reliable (RFC 3262 §3); removed Require: 100rel / RSeq"
+                        );
+                    }
+                    return self.respond_plain(response).await;
+                }
+                if !response.header_contains_token("Require", "100rel") {
+                    // Plain provisional response: sent immediately, never tracked.
+                    if strip_reliable_headers(&mut response) {
+                        warn!(
+                            key = %self.key,
+                            "RSeq without Require: 100rel is meaningless; removed"
+                        );
+                    }
+                    return self.respond_plain(response).await;
+                }
+                if !(self.original.header_contains_token("Supported", "100rel")
+                    || self.original.header_contains_token("Require", "100rel"))
+                {
+                    // RFC 3262 §3: "If the request did not include either a
+                    // Supported or Require header field indicating this feature,
+                    // the UAS MUST NOT send the provisional response reliably."
+                    strip_reliable_headers(&mut response);
+                    warn!(
+                        key = %self.key,
+                        "UAC did not advertise 100rel; sending the provisional response unreliably (RFC 3262 §3)"
+                    );
+                    return self.respond_plain(response).await;
+                }
+                if self.original_to_has_tag() {
+                    // RFC 3262 §3 / scope: only the initial (dialog-creating) INVITE
+                    // gets reliable provisional responses.
+                    strip_reliable_headers(&mut response);
+                    warn!(
+                        key = %self.key,
+                        "100rel on an in-dialog (re-)INVITE is not supported; sending the provisional response unreliably"
+                    );
+                    return self.respond_plain(response).await;
+                }
+                if self.rel1xx_unacked.is_some() || !self.rel1xx_pending.is_empty() {
+                    // RFC 3262 §3: MUST NOT send a second reliable provisional
+                    // response until the first is acknowledged — queue it.
+                    self.can_transition(&TransactionState::Proceeding)?;
+                    debug!(
+                        key = %self.key,
+                        status = %response.status_code,
+                        queued = self.rel1xx_pending.len() + 1,
+                        "queueing reliable provisional response until the outstanding one is acknowledged"
+                    );
+                    self.rel1xx_pending.push_back(response);
+                    return Ok(());
+                }
+                self.send_reliable_provisional(response).await
+            }
+            StatusCodeKind::Successful => {
+                if strip_reliable_headers(&mut response) {
+                    warn!(
+                        key = %self.key,
+                        "Require: 100rel / RSeq are only valid on provisional responses; removed from 2xx"
+                    );
+                }
+                let unacked_has_body = self
+                    .rel1xx_unacked
+                    .as_ref()
+                    .map(|u| u.has_body)
+                    .unwrap_or(false);
+                if unacked_has_body || !self.rel1xx_pending.is_empty() {
+                    // RFC 3262 §3: MUST NOT send a 2xx while a reliable provisional
+                    // response carrying a session description is unacknowledged.
+                    // A 2xx also never overtakes a queued reliable provisional.
+                    self.can_transition(&TransactionState::Completed)?;
+                    debug!(
+                        key = %self.key,
+                        queued = self.rel1xx_pending.len() + 1,
+                        "holding 2xx until reliable provisional responses are acknowledged"
+                    );
+                    self.rel1xx_pending.push_back(response);
+                    return Ok(());
+                }
+                let result = self.respond_plain(response).await;
+                self.finish_reliable_provisionals();
+                result
+            }
             _ => {
-                return Err(Error::TransactionError(
-                    "respond is only valid for server transactions".to_string(),
-                    self.key.clone(),
-                ));
+                if strip_reliable_headers(&mut response) {
+                    warn!(
+                        key = %self.key,
+                        "Require: 100rel / RSeq are only valid on provisional responses; removed from final response"
+                    );
+                }
+                let result = self.respond_plain(response).await;
+                self.finish_reliable_provisionals();
+                result
             }
         }
+    }
 
+    /// Send a response without any RFC 3262 bookkeeping: state check,
+    /// inspector, `last_response`, transport send, state transition.
+    async fn respond_plain(&mut self, response: Response) -> Result<()> {
         let new_state = match response.status_code.kind() {
             StatusCodeKind::Provisional => match response.status_code {
                 StatusCode::Trying => TransactionState::Trying,
@@ -404,20 +693,14 @@ impl Transaction {
         };
         // check an transition to new state
         self.can_transition(&new_state)?;
+        self.remember_local_to_tag(&response);
 
         let connection = self.connection.as_ref().ok_or(Error::TransactionError(
             "no connection found".to_string(),
             self.key.clone(),
         ))?;
 
-        let response = if let Some(ref inspector) = self.endpoint_inner.message_inspector {
-            inspector.before_send(
-                response.clone().to_owned().into(),
-                self.destination.as_ref(),
-            )
-        } else {
-            response.to_owned().into()
-        };
+        let response = self.inspect_before_send(response.into());
         trace!(key = %self.key, response = %response, "responding");
 
         match response.clone() {
@@ -426,6 +709,293 @@ impl Transaction {
         };
         connection.send(response, self.destination.as_ref()).await?;
         self.transition(new_state).map(|_| ())
+    }
+
+    /// Send a reliable provisional response (RFC 3262 §3): assign the RSeq,
+    /// send it, remember it as unacknowledged and arm the retransmission
+    /// (unreliable transports only) and 64*T1 timeout timers.
+    ///
+    /// Unlike [`Transaction::respond_plain`], a transport error does not abort:
+    /// the timers are armed regardless so that retransmission or the timeout
+    /// eventually resolve the INVITE instead of leaving it hanging.
+    async fn send_reliable_provisional(&mut self, mut response: Response) -> Result<()> {
+        self.can_transition(&TransactionState::Proceeding)?;
+        let connection = self.connection.clone().ok_or(Error::TransactionError(
+            "no connection found".to_string(),
+            self.key.clone(),
+        ))?;
+
+        // RFC 3261 §8.2.6.2: every non-100 response carries a To tag, and a
+        // reliable provisional response creates an early dialog.
+        let to = response.to_header()?.clone();
+        if to.tag()?.is_none() {
+            let tag: String = self
+                .local_to_tag
+                .clone()
+                .unwrap_or_else(|| make_tag().value().to_string());
+            response.headers.unique_push(to.with_tag(tag.into()).into());
+        }
+
+        // RSeq: the dialog layer (the single generator for dialog users) may
+        // already have assigned one; otherwise generate it here.
+        // Once this transaction has assigned an RSeq it is authoritative: RFC
+        // 3262 §3 requires +1 per reliable provisional response, and the
+        // stale-timer guards in `on_timer` rely on every reliable provisional
+        // of a transaction carrying a distinct RSeq.
+        let rseq = match response.rseq_value() {
+            Some(supplied) => match self.rel1xx_next_rseq {
+                Some(expected) if expected != supplied => {
+                    warn!(
+                        key = %self.key,
+                        supplied,
+                        expected,
+                        "supplied RSeq is not the expected next value; using the expected value (RFC 3262 §3: RSeq increments by exactly one per transaction)"
+                    );
+                    expected
+                }
+                _ => supplied,
+            },
+            None => self.rel1xx_next_rseq.unwrap_or(INITIAL_RSEQ),
+        };
+        let next_rseq = match rseq.checked_add(1) {
+            Some(next) => next,
+            None => {
+                // RFC 3262 §3: RSeq numbers MUST NOT wrap around.
+                strip_reliable_headers(&mut response);
+                warn!(
+                    key = %self.key,
+                    rseq,
+                    "RSeq space exhausted; sending the provisional response unreliably"
+                );
+                return self.respond_plain(response).await;
+            }
+        };
+        response.headers.retain(|h| !is_rseq_header(h));
+        response
+            .headers
+            .unique_push(Header::RSeq(rseq.to_string().into()));
+        self.rel1xx_next_rseq = Some(next_rseq);
+
+        let cseq_header = response.cseq_header()?;
+        let cseq = cseq_header.seq()?;
+        let method = cseq_header.method()?;
+        let call_id = response.call_id_header()?.value().to_string();
+        let from_tag = response
+            .from_header()?
+            .tag()?
+            .map(|t| t.value().to_string());
+        let to_tag = response.to_header()?.tag()?.map(|t| t.value().to_string());
+        let unacked = ReliableProvisional {
+            response: response.clone(),
+            rseq,
+            cseq,
+            method,
+            has_body: !response.body.is_empty(),
+            call_id,
+            from_tag,
+            to_tag,
+        };
+
+        self.remember_local_to_tag(&response);
+        let message = self.inspect_before_send(response.into());
+        trace!(key = %self.key, response = %message, rseq, "responding reliably");
+        if let SipMessage::Response(ref resp) = message {
+            self.last_response.replace(resp.clone());
+        }
+        if let Err(e) = connection.send(message, self.destination.as_ref()).await {
+            warn!(key = %self.key, error = %e, rseq, "reliable provisional response send failed");
+        }
+
+        self.cancel_rel1xx_timers();
+        self.rel1xx_unacked.replace(unacked);
+        if !connection.is_reliable() {
+            let t1 = self.endpoint_inner.option.t1;
+            let timer = self.endpoint_inner.timers.timeout(
+                t1,
+                TransactionTimer::TimerRel1xx(self.key.clone(), rseq, t1),
+            );
+            self.timer_rel1xx.replace(timer);
+        }
+        let timer = self.endpoint_inner.timers.timeout(
+            self.endpoint_inner.option.t1x64,
+            TransactionTimer::TimerRel1xxTimeout(self.key.clone(), rseq),
+        );
+        self.timer_rel1xx_timeout.replace(timer);
+        self.transition(TransactionState::Proceeding).map(|_| ())
+    }
+
+    /// Flush queued responses after the outstanding reliable provisional
+    /// response was acknowledged (or after one was just sent).
+    async fn drain_rel1xx_pending(&mut self) {
+        while let Some(front) = self.rel1xx_pending.front() {
+            let is_final = front.status_code.kind() != StatusCodeKind::Provisional;
+            if !is_final {
+                if self.rel1xx_unacked.is_some() {
+                    break;
+                }
+                let response = self.rel1xx_pending.pop_front().expect("front exists");
+                if let Err(e) = self.send_reliable_provisional(response).await {
+                    warn!(key = %self.key, error = %e, "failed to send queued reliable provisional response");
+                }
+                continue;
+            }
+            let blocked = self
+                .rel1xx_unacked
+                .as_ref()
+                .map(|u| u.has_body)
+                .unwrap_or(false);
+            if blocked {
+                break;
+            }
+            let response = self.rel1xx_pending.pop_front().expect("front exists");
+            debug!(key = %self.key, status = %response.status_code, "sending held final response");
+            if let Err(e) = self.respond_plain(response).await {
+                warn!(key = %self.key, error = %e, "failed to send held final response");
+            }
+            self.finish_reliable_provisionals();
+            break;
+        }
+    }
+
+    /// A final response was sent: stop retransmitting the unacknowledged
+    /// reliable provisional response (RFC 3262 §3 SHOULD NOT) and drop anything
+    /// still queued (MUST NOT send new reliable provisionals after a final).
+    fn finish_reliable_provisionals(&mut self) {
+        self.cancel_rel1xx_timers();
+        self.rel1xx_unacked.take();
+        if !self.rel1xx_pending.is_empty() {
+            warn!(
+                key = %self.key,
+                dropped = self.rel1xx_pending.len(),
+                "final response sent; dropping queued responses (RFC 3262 §3)"
+            );
+            self.rel1xx_pending.clear();
+        }
+    }
+
+    fn cancel_rel1xx_timers(&mut self) {
+        self.timer_rel1xx
+            .take()
+            .map(|id| self.endpoint_inner.timers.cancel(id));
+        self.timer_rel1xx_timeout
+            .take()
+            .map(|id| self.endpoint_inner.timers.cancel(id));
+    }
+
+    /// A PRACK forwarded to this server INVITE transaction (RFC 3262 §3).
+    async fn on_prack(&mut self, prack: &Request) {
+        let matched = self
+            .rel1xx_unacked
+            .as_ref()
+            .map(|u| u.matches_prack(prack))
+            .unwrap_or(false);
+        if !matched {
+            debug!(
+                key = %self.key,
+                rack = ?prack.rack_value(),
+                unacked = ?self.rel1xx_unacked.as_ref().map(|u| u.rseq),
+                "PRACK does not match the unacknowledged reliable provisional response; ignored"
+            );
+            return;
+        }
+        debug!(
+            key = %self.key,
+            rseq = self.rel1xx_unacked.as_ref().map(|u| u.rseq),
+            "reliable provisional response acknowledged"
+        );
+        self.cancel_rel1xx_timers();
+        self.rel1xx_unacked.take();
+        self.drain_rel1xx_pending().await;
+    }
+
+    /// RFC 3262 §3: no PRACK within 64*T1 — reject the INVITE with a 5xx.
+    async fn on_rel1xx_timeout(&mut self) -> Result<SipMessage> {
+        self.cancel_rel1xx_timers();
+        let unacked = self.rel1xx_unacked.take();
+        let dropped_final = self
+            .rel1xx_pending
+            .iter()
+            .any(|r| r.status_code.kind() != StatusCodeKind::Provisional);
+        warn!(
+            key = %self.key,
+            rseq = unacked.as_ref().map(|u| u.rseq),
+            dropped = self.rel1xx_pending.len(),
+            dropped_final,
+            "no PRACK received within 64*T1; rejecting INVITE with 500 (RFC 3262 §3)"
+        );
+        self.rel1xx_pending.clear();
+
+        let mut response = self.endpoint_inner.make_response(
+            &self.original,
+            StatusCode::ServerInternalError,
+            None,
+        );
+        // Carry the early dialog's To tag so the UAC matches the 500 to the
+        // dialog created by the reliable provisional response.
+        let to = match unacked.as_ref().and_then(|u| u.response.to_header().ok()) {
+            Some(to) => to.clone(),
+            None => response.to_header()?.clone(),
+        };
+        let to = if to.tag()?.is_none() {
+            let tag: String = self
+                .local_to_tag
+                .clone()
+                .unwrap_or_else(|| make_tag().value().to_string());
+            to.with_tag(tag.into())
+        } else {
+            to
+        };
+        response.headers.unique_push(Header::To(to));
+
+        if let Err(e) = self.respond_plain(response.clone()).await {
+            warn!(key = %self.key, error = %e, "failed to send 500 after PRACK timeout");
+            if self.state != TransactionState::Completed {
+                self.transition(TransactionState::Terminated).ok();
+            }
+        }
+        Ok(SipMessage::Response(response))
+    }
+
+    fn original_to_has_tag(&self) -> bool {
+        self.original
+            .to_header()
+            .ok()
+            .and_then(|to| to.tag().ok().flatten())
+            .is_some()
+    }
+
+    /// Remember the To tag of the first non-100 response of a server INVITE
+    /// transaction (see `local_to_tag`).
+    fn remember_local_to_tag(&mut self, response: &Response) {
+        if self.transaction_type != TransactionType::ServerInvite
+            || self.local_to_tag.is_some()
+            || response.status_code == StatusCode::Trying
+        {
+            return;
+        }
+        if let Ok(Some(tag)) = response.to_header().and_then(|to| to.tag()) {
+            self.local_to_tag = Some(tag.value().to_string());
+        }
+    }
+
+    fn inspect_before_send(&self, msg: SipMessage) -> SipMessage {
+        if let Some(ref inspector) = self.endpoint_inner.message_inspector {
+            inspector.before_send(msg, self.destination.as_ref())
+        } else {
+            msg
+        }
+    }
+
+    /// Retransmit a response: message inspector + transport send, with no
+    /// state or RFC 3262 bookkeeping. Used by every retransmission path
+    /// (request retransmissions, Timer G, TimerRel1xx).
+    async fn send_response_raw(&self, response: &Response) -> Result<()> {
+        let connection = self.connection.as_ref().ok_or(Error::TransactionError(
+            "no connection found".to_string(),
+            self.key.clone(),
+        ))?;
+        let message = self.inspect_before_send(response.clone().into());
+        connection.send(message, self.destination.as_ref()).await
     }
 
     fn can_transition(&self, target: &TransactionState) -> Result<()> {
@@ -595,6 +1165,15 @@ impl Transaction {
         self.transition(TransactionState::Terminated).map(|_| ())
     }
 
+    /// Wait for the next message that the transaction user must handle.
+    ///
+    /// Returns `None` once the transaction is terminated.
+    ///
+    /// For a server INVITE transaction a returned `SipMessage::Response` is a
+    /// *locally synthesized* final response — currently only the
+    /// `500 Server Internal Error` sent when a reliable provisional response was
+    /// not acknowledged within 64*T1 (RFC 3262 §3). It has already been sent on
+    /// the wire; the transaction user only needs to update its own state.
     pub async fn receive(&mut self) -> Option<SipMessage> {
         while let Some(event) = self.tu_receiver.recv().await {
             match event {
@@ -608,9 +1187,11 @@ impl Transaction {
                         return Some(msg);
                     }
                 }
-                TransactionEvent::Timer(t) => {
-                    self.on_timer(t).await.ok();
-                }
+                TransactionEvent::Timer(t) => match self.on_timer(t).await {
+                    Ok(Some(msg)) => return Some(msg),
+                    Ok(None) => {}
+                    Err(e) => debug!(key = %self.key, error = %e, "timer handling failed"),
+                },
                 TransactionEvent::Respond(response) => {
                     self.respond(response).await.ok();
                 }
@@ -709,11 +1290,22 @@ impl Transaction {
             return forward_to_tu.then(|| req.into());
         }
 
+        // A PRACK forwarded by the dialog layer acknowledges the outstanding
+        // reliable provisional response (RFC 3262). It has its own server
+        // transaction, so it is never surfaced to the TU from here. This must
+        // precede the request-retransmission arm below.
+        if req.method == Method::PRack && self.transaction_type == TransactionType::ServerInvite {
+            self.on_prack(&req).await;
+            return None;
+        }
+
         match self.state {
             TransactionState::Trying | TransactionState::Proceeding => {
-                // retransmission of last response
+                // retransmission of last response (no state / RFC 3262 bookkeeping)
                 if let Some(last_response) = &self.last_response {
-                    self.respond(last_response.to_owned()).await.ok();
+                    if let Err(e) = self.send_response_raw(last_response).await {
+                        debug!(key = %self.key, error = %e, "response retransmission failed");
+                    }
                 }
             }
             TransactionState::Completed | TransactionState::Confirmed
@@ -776,7 +1368,43 @@ impl Transaction {
         Some(SipMessage::Response(resp))
     }
 
-    async fn on_timer(&mut self, timer: TransactionTimer) -> Result<()> {
+    /// Handle a transaction timer. Returns a message the TU must handle, if any
+    /// (the RFC 3262 timeout 500 for server INVITE transactions).
+    async fn on_timer(&mut self, timer: TransactionTimer) -> Result<Option<SipMessage>> {
+        match &timer {
+            TransactionTimer::TimerRel1xx(key, rseq, duration) => {
+                let current = self.rel1xx_unacked.as_ref().map(|u| u.rseq);
+                if self.state != TransactionState::Proceeding || current != Some(*rseq) {
+                    trace!(key = %self.key, rseq, "ignoring stale TimerRel1xx");
+                    return Ok(None);
+                }
+                let response = self
+                    .rel1xx_unacked
+                    .as_ref()
+                    .map(|u| u.response.clone())
+                    .expect("checked above");
+                if let Err(e) = self.send_response_raw(&response).await {
+                    warn!(key = %self.key, error = %e, "reliable provisional retransmission failed");
+                }
+                // RFC 3262 §3: doubles on every retransmission, no T2 cap.
+                let duration = *duration * 2;
+                let timer_id = self.endpoint_inner.timers.timeout(
+                    duration,
+                    TransactionTimer::TimerRel1xx(key.clone(), *rseq, duration),
+                );
+                self.timer_rel1xx.replace(timer_id);
+                return Ok(None);
+            }
+            TransactionTimer::TimerRel1xxTimeout(_, rseq) => {
+                let current = self.rel1xx_unacked.as_ref().map(|u| u.rseq);
+                if self.state != TransactionState::Proceeding || current != Some(*rseq) {
+                    trace!(key = %self.key, rseq, "ignoring stale TimerRel1xxTimeout");
+                    return Ok(None);
+                }
+                return self.on_rel1xx_timeout().await.map(Some);
+            }
+            _ => {}
+        }
         match self.state {
             TransactionState::Calling | TransactionState::Trying => {
                 if matches!(
@@ -785,7 +1413,7 @@ impl Transaction {
                 ) {
                     if let TransactionTimer::TimerA(key, duration) = timer {
                         if !self.retransmission {
-                            return Ok(());
+                            return Ok(None);
                         }
                         // If no connection (initial lookup failed), retry transport lookup
                         // using the same target resolution rule as send()
@@ -856,20 +1484,8 @@ impl Transaction {
                 if let TransactionTimer::TimerG(key, duration) = timer {
                     // resend the response
                     if let Some(last_response) = &self.last_response {
-                        if let Some(connection) = &self.connection {
-                            let last_response = if let Some(ref inspector) =
-                                self.endpoint_inner.message_inspector
-                            {
-                                inspector.before_send(
-                                    last_response.to_owned().into(),
-                                    self.destination.as_ref(),
-                                )
-                            } else {
-                                last_response.to_owned().into()
-                            };
-                            connection
-                                .send(last_response, self.destination.as_ref())
-                                .await?;
+                        if self.connection.is_some() {
+                            self.send_response_raw(last_response).await?;
                         }
                     }
                     // restart Timer G with an upper limit
@@ -892,7 +1508,7 @@ impl Transaction {
             }
             _ => {}
         }
-        Ok(())
+        Ok(None)
     }
 
     fn transition(&mut self, state: TransactionState) -> Result<TransactionState> {
@@ -966,6 +1582,7 @@ impl Transaction {
                 self.timer_c
                     .take()
                     .map(|id| self.endpoint_inner.timers.cancel(id));
+                self.cancel_rel1xx_timers();
 
                 if self.transaction_type == TransactionType::ServerInvite {
                     // start Timer G for server invite only
@@ -973,6 +1590,14 @@ impl Transaction {
                         "no connection found".to_string(),
                         self.key.clone(),
                     ))?;
+                    // Resolve the dialog id before arming any timer so a failure
+                    // leaves no half-applied state.
+                    let dialog_id = match self.last_response {
+                        Some(ref resp) => {
+                            Some(DialogId::try_from((resp, TransactionRole::Server))?)
+                        }
+                        None => None,
+                    };
                     if !connection.is_reliable() {
                         let timer_g = self.endpoint_inner.timers.timeout(
                             self.endpoint_inner.option.t1,
@@ -984,8 +1609,7 @@ impl Transaction {
                         self.timer_g.replace(timer_g);
                     }
                     debug!(key=%self.key, last = self.last_response.is_none(), "entered confirmed state, waiting for ACK");
-                    if let Some(ref resp) = self.last_response {
-                        let dialog_id = DialogId::try_from((resp, TransactionRole::Server))?;
+                    if let Some(dialog_id) = dialog_id {
                         self.endpoint_inner
                             .waiting_ack
                             .insert(dialog_id, self.key.clone());
@@ -1056,6 +1680,7 @@ impl Transaction {
         self.timer_g
             .take()
             .map(|id| self.endpoint_inner.timers.cancel(id));
+        self.cancel_rel1xx_timers();
     }
 
     pub fn role(&self) -> TransactionRole {
@@ -1072,6 +1697,17 @@ impl Transaction {
             return;
         }
         self.is_cleaned_up = true;
+        if self.rel1xx_unacked.is_some() || !self.rel1xx_pending.is_empty() {
+            warn!(
+                key = %self.key,
+                state = %self.state,
+                unacked = ?self.rel1xx_unacked.as_ref().map(|u| u.rseq),
+                dropped = self.rel1xx_pending.len(),
+                held_final = self.rel1xx_pending.iter().any(|r| r.status_code.kind() != StatusCodeKind::Provisional),
+                "transaction cleaned up with reliable provisional state outstanding; queued responses are lost"
+            );
+            self.rel1xx_pending.clear();
+        }
         self.cleanup_timer();
 
         // For ServerInvite in Completed state, keep the waiting_ack entry
@@ -1120,6 +1756,27 @@ impl Transaction {
         };
         self.endpoint_inner
             .detach_transaction(&self.key, last_message);
+    }
+}
+
+#[cfg(test)]
+impl Transaction {
+    pub(crate) fn rel1xx_unacked_rseq(&self) -> Option<u32> {
+        self.rel1xx_unacked.as_ref().map(|u| u.rseq)
+    }
+    pub(crate) fn rel1xx_pending_len(&self) -> usize {
+        self.rel1xx_pending.len()
+    }
+    pub(crate) fn rel1xx_timers_armed(&self) -> (bool, bool) {
+        (
+            self.timer_rel1xx.is_some(),
+            self.timer_rel1xx_timeout.is_some(),
+        )
+    }
+    /// The pending RFC 3262 retransmission timer, if one is armed.
+    pub(crate) fn rel1xx_retransmit_timer(&self) -> Option<TransactionTimer> {
+        self.timer_rel1xx
+            .and_then(|id| self.endpoint_inner.timers.peek(id))
     }
 }
 

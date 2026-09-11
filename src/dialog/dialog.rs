@@ -15,7 +15,7 @@ use crate::{
     transaction::{
         endpoint::EndpointInnerRef,
         key::{TransactionKey, TransactionRole},
-        transaction::{Transaction, TransactionEventSender},
+        transaction::{Transaction, TransactionEvent, TransactionEventSender},
     },
     transport::{SipAddr, SipConnection},
     Result,
@@ -131,6 +131,12 @@ pub enum DialogState {
 #[derive(Debug, Clone)]
 pub enum TerminatedReason {
     Timeout,
+    /// A reliable provisional response (RFC 3262) sent by this UAS dialog was
+    /// not acknowledged with a PRACK within 64*T1; the INVITE was rejected
+    /// with `500 Server Internal Error`. If the application had already
+    /// accepted the call (the 2xx was being held behind an unacknowledged
+    /// provisional response carrying a body) that 2xx was never sent.
+    PrackTimeout,
     UacCancel,
     UacBye,
     UasBye,
@@ -270,6 +276,35 @@ pub(super) struct RemoteReliableState {
     prack_request: Request,
 }
 
+/// A reliable provisional response (RFC 3262) sent by this UAS dialog and not
+/// yet acknowledged by a matching PRACK.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OutstandingProvisional {
+    pub rseq: u32,
+    pub cseq: u32,
+    pub method: Method,
+}
+
+/// UAS-side RFC 3262 state: the dialog is the single RSeq generator for
+/// dialog users (the transaction layer only generates RSeq for raw
+/// transaction users) and remembers which reliable provisional responses may
+/// still be PRACKed.
+#[derive(Default)]
+pub(super) struct LocalReliableState {
+    /// Next RSeq to assign; starts at [`crate::transaction::INITIAL_RSEQ`] (1)
+    /// and increments by one per reliable provisional response.
+    pub next_rseq: Option<u32>,
+    /// Reliable provisional responses handed to the transaction that have not
+    /// been acknowledged. Entries are removed only by a matching PRACK.
+    /// Responses already handed to the transaction stay PRACK-able after any
+    /// final response (RFC 3262 §3: the UAS MUST be prepared to process PRACKs
+    /// for outstanding responses); the transaction layer simply ignores the
+    /// forwarded PRACK once it has sent a final. The list cannot grow after
+    /// termination (`ringing()` is a no-op then) and the dialog is dropped by
+    /// the application shortly after.
+    pub outstanding: Vec<OutstandingProvisional>,
+}
+
 /// Internal Dialog State and Management
 ///
 /// `DialogInner` contains the core state and functionality shared between
@@ -329,6 +364,8 @@ pub struct DialogInner {
     pub(super) initial_request: Mutex<Request>,
     pub(super) supports_100rel: bool,
     pub(super) remote_reliable: Mutex<Option<RemoteReliableState>>,
+    /// UAS-side reliable provisional response bookkeeping (RFC 3262).
+    pub(super) local_reliable: Mutex<LocalReliableState>,
     pub(super) server_connection: Mutex<Option<SipConnection>>,
     /// Structural source address of the flow that created this server dialog,
     /// captured at creation time from the connection itself (not parsed from
@@ -483,6 +520,7 @@ impl DialogInner {
             remote_contact: Mutex::new(None),
             supports_100rel,
             remote_reliable: Mutex::new(None),
+            local_reliable: Mutex::new(LocalReliableState::default()),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         })
@@ -920,6 +958,194 @@ impl DialogInner {
         }
     }
 
+    /// Build a non-100 provisional response to the initial INVITE, applying
+    /// the RFC 3262 reliable-provisional policy.
+    ///
+    /// Policy (the application's `Require: 100rel` header is the only switch;
+    /// the UAC's own `Require: 100rel` never forces reliability):
+    /// * reliable iff `headers` contain the `100rel` token in a `Require`
+    ///   header AND the initial INVITE advertised `100rel` (`Supported` or
+    ///   `Require`);
+    /// * when reliable, `Require: 100rel` is ensured and the library assigns
+    ///   the `RSeq` (starting at 1 for the first reliable provisional response
+    ///   of the INVITE, then +1 per reliable response);
+    ///   any application-supplied `RSeq` header is discarded with a warning;
+    /// * when the application asks for reliability but the UAC did not
+    ///   advertise `100rel`, the `100rel` token and any `RSeq` are stripped
+    ///   (RFC 3262 §3 MUST NOT) and the response goes out unreliably;
+    /// * when the UAC required `100rel` but the application did not ask for
+    ///   reliability, the response goes out unreliably with a warning —
+    ///   honouring the UAC's `Require` (or rejecting with 420 + `Unsupported:
+    ///   100rel`) is the application's responsibility.
+    ///
+    /// Application headers are passed through untouched — the library never
+    /// reformats, merges or re-spaces them. The only edits are the removal of
+    /// any application-supplied `RSeq` header (RSeq is library-owned) and, in
+    /// the misuse cases above, the removal of the `100rel` token.
+    pub(super) fn make_provisional_response(
+        &self,
+        status: StatusCode,
+        headers: Option<Vec<Header>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<Response> {
+        let initial = self.initial_request.lock().clone();
+        let uac_requires = initial.header_contains_token("Require", "100rel");
+        let uac_supports = initial.header_contains_token("Supported", "100rel");
+
+        let mut headers = headers.unwrap_or_default();
+
+        if crate::transaction::transaction::remove_rseq_headers(&mut headers) {
+            warn!(
+                id = %self.id.lock(),
+                "application-supplied RSeq header ignored; RSeq is generated by the library"
+            );
+        }
+
+        let has_100rel = |value: &str| {
+            value
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("100rel"))
+        };
+        let app_requested = headers.iter().any(|h| match h {
+            Header::Require(v) => has_100rel(v.value()),
+            Header::Other(name, v) if name.eq_ignore_ascii_case("Require") => has_100rel(v),
+            _ => false,
+        });
+        let reliable = app_requested && (uac_supports || uac_requires);
+
+        if app_requested && !reliable {
+            warn!(
+                id = %self.id.lock(),
+                "UAC did not advertise 100rel; sending the provisional response unreliably (RFC 3262 §3)"
+            );
+            crate::transaction::transaction::strip_require_token(&mut headers, "100rel");
+        }
+        if uac_requires && !app_requested {
+            warn!(
+                id = %self.id.lock(),
+                "UAC required 100rel but the application sent this provisional response unreliably"
+            );
+        }
+
+        if reliable {
+            let cseq = initial.cseq_header()?.seq()?;
+            let mut state = self.local_reliable.lock();
+            let rseq = *state
+                .next_rseq
+                .get_or_insert(crate::transaction::INITIAL_RSEQ);
+            match rseq.checked_add(1) {
+                Some(next) => {
+                    state.next_rseq = Some(next);
+                    headers.push(Header::RSeq(rseq.to_string().into()));
+                    state.outstanding.push(OutstandingProvisional {
+                        rseq,
+                        cseq,
+                        method: Method::Invite,
+                    });
+                    debug!(id = %self.id.lock(), rseq, %status, "reliable provisional response");
+                }
+                None => {
+                    // RFC 3262 §3: RSeq numbers MUST NOT wrap around.
+                    warn!(
+                        id = %self.id.lock(),
+                        "RSeq space exhausted; sending the provisional response unreliably"
+                    );
+                    crate::transaction::transaction::strip_require_token(&mut headers, "100rel");
+                }
+            }
+        }
+
+        Ok(self.make_response(&initial, status, Some(headers), body))
+    }
+
+    /// Handle an incoming PRACK (RFC 3262 §3) for this UAS dialog.
+    ///
+    /// * missing/unparseable `RAck` → `400 Bad Request`;
+    /// * matches an unacknowledged reliable provisional response → the PRACK
+    ///   is forwarded to the INVITE transaction (which stops retransmitting
+    ///   and releases queued responses) and answered with `200 OK`;
+    /// * otherwise → `481 Call/Transaction Does Not Exist`.
+    ///
+    /// The `RAck` method token is compared case-insensitively (a deliberate
+    /// leniency; RFC 3262 §7.2 defines it as case sensitive). Transport errors
+    /// while replying are logged, never returned.
+    pub(super) async fn handle_prack(&self, tx: &mut Transaction) -> Result<()> {
+        debug!(id = %self.id.lock(), uri = %tx.original.uri, "received prack");
+        let Some((rseq, cseq, method)) = tx.original.rack_value() else {
+            warn!(id = %self.id.lock(), "received PRACK without a valid RAck header");
+            if let Err(e) = tx.reply(StatusCode::BadRequest).await {
+                warn!(id = %self.id.lock(), error = %e, "failed to reply 400 to PRACK");
+            }
+            return Ok(());
+        };
+
+        let matched = {
+            let mut state = self.local_reliable.lock();
+            match state
+                .outstanding
+                .iter()
+                .position(|o| o.rseq == rseq && o.cseq == cseq && o.method == method)
+            {
+                Some(pos) => {
+                    state.outstanding.remove(pos);
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if matched {
+            debug!(id = %self.id.lock(), rseq, cseq, %method, "PRACK acknowledged reliable provisional response");
+            self.tu_sender
+                .send(TransactionEvent::Received(tx.original.clone().into(), None))
+                .ok();
+            if let Err(e) = tx.reply(StatusCode::OK).await {
+                warn!(id = %self.id.lock(), error = %e, "failed to reply 200 to PRACK");
+            }
+        } else {
+            warn!(
+                id = %self.id.lock(),
+                rseq,
+                cseq,
+                %method,
+                "PRACK does not match an unacknowledged reliable provisional response; replying 481"
+            );
+            if let Err(e) = tx.reply(StatusCode::CallTransactionDoesNotExist).await {
+                warn!(id = %self.id.lock(), error = %e, "failed to reply 481 to PRACK");
+            }
+        }
+        Ok(())
+    }
+
+    /// A `SipMessage::Response` returned by [`Transaction::receive`] on the
+    /// server INVITE transaction: by contract a locally synthesized final —
+    /// today only the RFC 3262 PRACK-timeout `500 Server Internal Error`.
+    /// Transitions the dialog to `Terminated(PrackTimeout)`.
+    pub(super) fn on_local_final_response(&self, tx: &Transaction, resp: &Response) -> Result<()> {
+        let is_invite_500 = resp.status_code == StatusCode::ServerInternalError
+            && resp
+                .cseq_header()
+                .and_then(|c| c.method())
+                .map(|m| m == Method::Invite)
+                .unwrap_or(false);
+        if !is_invite_500 {
+            debug!(id = %self.id.lock(), status = %resp.status_code, "ignoring local response");
+            return Ok(());
+        }
+        if self.is_terminated() || self.is_confirmed() {
+            return Ok(());
+        }
+        let accepted = self.waiting_ack();
+        warn!(
+            id = %self.id.lock(),
+            key = %tx.key,
+            accepted_but_undelivered = accepted,
+            "reliable provisional response not acknowledged within 64*T1; INVITE rejected with 500"
+        );
+        let id = self.id.lock().clone();
+        self.transition(DialogState::Terminated(id, TerminatedReason::PrackTimeout))
+    }
+
     /// Resolve the connection to reuse for outgoing in-dialog requests
     /// (RFC 5626 flow affinity / RFC 7118 §6.2).
     ///
@@ -1265,6 +1491,7 @@ impl DialogInner {
             initial_request,
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
+            local_reliable: Mutex::new(LocalReliableState::default()),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         }))

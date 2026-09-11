@@ -259,27 +259,38 @@ pub trait HeadersExt: HasHeaders {
     fn path_headers(&self) -> Vec<&crate::sip::headers::untyped::Path> {
         all_headers!(self.headers().iter(), Header::Path)
     }
+    /// Value of the `RSeq` header (RFC 3262), if present and numeric.
+    ///
+    /// Accepts both the typed `Header::RSeq` form and an untyped
+    /// `Header::Other("RSeq", ..)` (name matched case-insensitively) so that
+    /// hand-built and parsed messages are treated alike.
     fn rseq_value(&self) -> Option<u32> {
-        self.headers().iter().find_map(|h| {
-            if let Header::RSeq(r) = h {
-                r.value().trim().parse().ok()
-            } else {
-                None
+        self.headers().iter().find_map(|h| match h {
+            Header::RSeq(r) => r.value().trim().parse().ok(),
+            Header::Other(name, value) if name.eq_ignore_ascii_case("RSeq") => {
+                value.trim().parse().ok()
             }
+            _ => None,
         })
     }
+    /// Parsed `RAck` header (RFC 3262): `(response-num, CSeq-num, method)`.
+    ///
+    /// Accepts both the typed `Header::RAck` form and an untyped
+    /// `Header::Other("RAck", ..)`. The method token is parsed leniently
+    /// (case-insensitively) even though RFC 3262 §7.2 defines it as case
+    /// sensitive; this is a deliberate robustness choice.
     fn rack_value(&self) -> Option<(u32, u32, Method)> {
         self.headers().iter().find_map(|h| {
-            if let Header::RAck(r) = h {
-                let v = r.value();
-                let mut parts = v.split_whitespace();
-                let rseq = parts.next()?.parse::<u32>().ok()?;
-                let cseq = parts.next()?.parse::<u32>().ok()?;
-                let method = parts.next()?.parse::<Method>().ok()?;
-                Some((rseq, cseq, method))
-            } else {
-                None
-            }
+            let v = match h {
+                Header::RAck(r) => r.value().to_string(),
+                Header::Other(name, value) if name.eq_ignore_ascii_case("RAck") => value.clone(),
+                _ => return None,
+            };
+            let mut parts = v.split_whitespace();
+            let rseq = parts.next()?.parse::<u32>().ok()?;
+            let cseq = parts.next()?.parse::<u32>().ok()?;
+            let method = parts.next()?.parse::<Method>().ok()?;
+            Some((rseq, cseq, method))
         })
     }
     fn header_value(&self, name: &str) -> Option<String> {
@@ -291,16 +302,27 @@ pub trait HeadersExt: HasHeaders {
             }
         })
     }
+    /// Whether the comma-separated header `name` contains `token`
+    /// (both compared case-insensitively).
+    ///
+    /// Matches the typed `Header::Supported` / `Header::Require` variants as
+    /// well as an untyped `Header::Other(name, ..)` with the same name.
     fn header_contains_token(&self, name: &str, token: &str) -> bool {
+        let has_token = |value: &str| {
+            value
+                .split(',')
+                .any(|item| item.trim().eq_ignore_ascii_case(token))
+        };
         self.headers().iter().any(|header| match header {
-            Header::Supported(value) if name.eq_ignore_ascii_case("Supported") => value
-                .value()
-                .split(',')
-                .any(|item| item.trim().eq_ignore_ascii_case(token)),
-            Header::Require(value) if name.eq_ignore_ascii_case("Require") => value
-                .value()
-                .split(',')
-                .any(|item| item.trim().eq_ignore_ascii_case(token)),
+            Header::Supported(value) if name.eq_ignore_ascii_case("Supported") => {
+                has_token(value.value())
+            }
+            Header::Require(value) if name.eq_ignore_ascii_case("Require") => {
+                has_token(value.value())
+            }
+            Header::Other(other_name, value) if other_name.eq_ignore_ascii_case(name) => {
+                has_token(value)
+            }
             _ => false,
         })
     }
