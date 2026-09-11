@@ -48,12 +48,12 @@ impl Contact {
         };
 
         let mut uri = crate::sip::parse_uri(uri_part)?;
-        uri.params.retain(|param| {
-            !matches!(
-                param,
-                crate::sip::uri::Param::Transport(crate::sip::Transport::Udp)
-            )
-        });
+        // uri.params.retain(|param| {
+        //     !matches!(
+        //         param,
+        //         crate::sip::uri::Param::Transport(crate::sip::Transport::Udp)
+        //     )
+        // });
         uri.headers.clear();
         let params = parse_contact_header_params(header_params_part)?;
         Ok(Contact {
@@ -226,7 +226,35 @@ mod tests {
         assert_eq!(contacts[1].uri.to_string(), "sip:1001@192.0.2.10:13050");
         assert_eq!(contacts[0].expires(), Some(573));
         assert_eq!(contacts[1].expires(), Some(3600));
-        assert!(contacts[0].params.iter().any(|param| matches!(param, Param::Other(name, Some(value)) if name.value().eq_ignore_ascii_case("+sip.instance") && value.value() == "\"<urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee>\"")));
+        assert!(contacts[0].params.iter().any(|param| matches!(param, Param::Other(name, Some(value)) if name.value().eq_ignore_ascii_case("+sip.instance") && value.value() == "<urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee>")));
+        assert!(contacts[0].to_string().contains(
+            ";+sip.instance=\"<urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee>\"",
+        ));
+    }
+
+    #[test]
+    fn contact_pub_gruu_value_is_unquoted_and_reserializes_quoted() {
+        let contact = Contact::parse(concat!(
+            "<sip:alice@example.com>;pub-gruu=\"",
+            "sip:alice@example.com;gr=urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"",
+        )).unwrap();
+        let pub_gruu = contact.params.iter().find_map(|param| match param {
+            Param::Other(name, Some(value)) if name.value().eq_ignore_ascii_case("pub-gruu") => {
+                Some(value.value())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            pub_gruu,
+            Some("sip:alice@example.com;gr=urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        );
+        assert_eq!(
+            contact.to_string(),
+            concat!(
+                "<sip:alice@example.com>;pub-gruu=\"",
+                "sip:alice@example.com;gr=urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"",
+            ),
+        );
     }
 
     #[test]

@@ -90,10 +90,10 @@ impl std::fmt::Display for AuthQop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auth { cnonce, nc } => {
-                write!(f, "qop=\"auth\", nc={:08}, cnonce=\"{}\"", nc, cnonce)
+                write!(f, "qop=auth, nc={:08}, cnonce=\"{}\"", nc, cnonce)
             }
             Self::AuthInt { cnonce, nc } => {
-                write!(f, "qop=\"auth-int\", nc={:08}, cnonce=\"{}\"", nc, cnonce)
+                write!(f, "qop=auth-int, nc={:08}, cnonce=\"{}\"", nc, cnonce)
             }
         }
     }

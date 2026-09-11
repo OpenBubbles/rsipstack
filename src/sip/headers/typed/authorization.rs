@@ -86,17 +86,17 @@ impl std::fmt::Display for Authorization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
+            "{} username=\"{}\",realm=\"{}\",nonce=\"{}\",uri=\"{}\",response=\"{}\"",
             self.scheme, self.username, self.realm, self.nonce, self.uri, self.response
         )?;
         if let Some(a) = &self.algorithm {
-            write!(f, ", algorithm={}", a)?;
+            write!(f, ",algorithm={}", a)?;
         }
         if let Some(o) = &self.opaque {
-            write!(f, ", opaque=\"{}\"", o)?;
+            write!(f, ",opaque=\"{}\"", o)?;
         }
         if let Some(q) = &self.qop {
-            write!(f, ", {}", q)?;
+            write!(f, ",{}", q)?;
         }
         Ok(())
     }
