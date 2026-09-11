@@ -117,6 +117,7 @@ pub struct Registration {
     /// Public address detected by the server (IP and port)
     pub public_address: Option<crate::sip::HostWithPort>,
     pub call_id: crate::sip::headers::CallId,
+    pub session_id: Option<String>,
     /// Outbound proxy — override transport destination while keeping the
     /// domain in SIP headers. Used for NAT traversal with load-balanced
     /// proxy clusters where DNS may resolve to different IPs.
@@ -169,6 +170,7 @@ impl Registration {
             allow: None,
             public_address: None,
             call_id,
+            session_id: None,
             outbound_proxy: None,
         }
     }
@@ -410,6 +412,7 @@ impl Registration {
             to,
             self.last_seq,
             None,
+            self.session_id.clone(),
         );
 
         // Thanks to https://github.com/restsend/rsipstack/issues/32

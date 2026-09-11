@@ -140,6 +140,7 @@ pub struct InviteOption {
     pub headers: Option<Vec<crate::sip::Header>>,
     pub support_prack: bool,
     pub call_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 pub struct DialogGuard {
@@ -357,6 +358,7 @@ impl DialogLayer {
             to,
             last_seq,
             call_id,
+            opt.session_id.clone(),
         );
 
         let contact = if let Some(ref addr) = transport_addr {

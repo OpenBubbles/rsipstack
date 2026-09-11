@@ -306,6 +306,7 @@ pub struct DialogInner {
     pub role: TransactionRole,
     pub cancel_token: CancellationToken,
     pub id: Mutex<DialogId>,
+    pub session_id: Mutex<Option<String>>,
     pub state: Mutex<DialogState>,
 
     pub local_seq: AtomicU32,
@@ -442,6 +443,8 @@ impl DialogInner {
             }
         }
 
+        let session = initial_request.headers.iter().find(|i| i.name() == "Session-ID").map(|i| i.value().to_string());
+
         let mut route_set = vec![];
         for h in initial_request.headers.iter() {
             if let Header::RecordRoute(rr) = h {
@@ -453,15 +456,22 @@ impl DialogInner {
         let supports_100rel = initial_request.header_contains_token("Supported", "100rel")
             || initial_request.header_contains_token("Require", "100rel");
 
+        // RFC 3261 explicitly distinguishes those two directions. RFC 3261 §12.1.1
+        let (local_seq, remote_seq) = match role {
+            TransactionRole::Client => (cseq, 0),
+            TransactionRole::Server => (0, cseq),
+        };
+
         Ok(Self {
             role,
             cancel_token: CancellationToken::new(),
             id: Mutex::new(id.clone()),
             from,
             to: Mutex::new(to),
-            local_seq: AtomicU32::new(cseq),
+            session_id: Mutex::new(session),
+            local_seq: AtomicU32::new(local_seq),
             remote_uri: Mutex::new(remote_uri),
-            remote_seq: AtomicU32::new(0),
+            remote_seq: AtomicU32::new(remote_seq),
             credential,
             route_set: Mutex::new(route_set),
             endpoint_inner,
@@ -583,6 +593,17 @@ impl DialogInner {
         let to_header = resp.to_header()?;
         if let Ok(Some(tag)) = to_header.tag() {
             self.update_remote_tag(tag.value())?;
+            if resp.headers().iter().any(|header| matches!(header, Header::RecordRoute(_))) {
+                self.update_route_set_from_response(resp);
+            }
+
+            if let Ok(contact) = resp.contact_header() {
+                self.remote_contact.lock().replace(contact.clone());
+
+                if let Some(contact) = resp.typed_contact_headers()?.first() {
+                    *self.remote_uri.lock() = contact.uri.clone();
+                }
+            }
         }
 
         if let Some(prack) = self.prepare_prack_request(resp)? {
@@ -742,6 +763,11 @@ impl DialogInner {
         let to = self.to.lock().clone().to_string();
 
         let from = self.from.clone().to_string();
+
+        let session_id = self.session_id.lock().clone();
+        if let Some(session_id) = session_id {
+            out.push(Header::Other("Session-ID".to_string(), session_id));
+        }
 
         match self.role {
             TransactionRole::Client => {
@@ -1213,6 +1239,7 @@ impl DialogInner {
             cancel_token: CancellationToken::new(),
 
             id: Mutex::new(snapshot.id.clone()),
+            session_id: Mutex::new(None),
             state: Mutex::new(DialogState::Confirmed(
                 snapshot.id.clone(),
                 Response::default(),

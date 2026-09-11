@@ -100,9 +100,10 @@ impl EndpointInner {
         to: crate::sip::typed::To,
         seq: u32,
         call_id: Option<CallId>,
+        session_id: Option<String>,
     ) -> Request {
         let call_id = call_id.unwrap_or_else(|| make_call_id(self.option.callid_suffix.as_deref()));
-        let headers = vec![
+        let mut headers = vec![
             Header::Via(via.into()),
             Header::CallId(call_id),
             Header::From(from.into()),
@@ -111,6 +112,9 @@ impl EndpointInner {
             Header::MaxForwards(70.into()),
             Header::UserAgent(self.user_agent.clone().into()),
         ];
+        if let Some(session) = &session_id {
+            headers.push(Header::Other("Session-ID".to_owned(), session.to_string()));
+        }
         Request {
             method,
             uri: req_uri,
@@ -232,7 +236,7 @@ impl EndpointInner {
                     | Header::From(_)
                     | Header::To(_)
                     | Header::CSeq(_)
-            )
+            ) || matches!(h, Header::Other(i, _) if i == "Session-ID")
         });
         headers.push(Header::ContentLength(
             body.as_ref().map_or(0u32, |b| b.len() as u32).into(),
@@ -347,6 +351,9 @@ impl EndpointInner {
             }
         });
         headers.push(Header::ContentLength(0u32.into())); // 0 because of vec![] below
+        if let Some(header) = invite.headers.iter().find(|i| i.name() == "Session-ID") {
+            headers.push(header.clone());
+        }
         headers.unique_push(Header::UserAgent(self.user_agent.clone().into()));
         Ok(Request {
             method: crate::sip::Method::Ack,
