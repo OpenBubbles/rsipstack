@@ -316,10 +316,62 @@ impl fmt::Display for Param {
             Self::Tag(t) => write!(f, ";tag={}", t),
             Self::Expires(e) => write!(f, ";expires={}", e),
             Self::Q(q) => write!(f, ";q={}", q),
-            Self::Other(name, Some(val)) => write!(f, ";{}={}", name, val),
+            Self::Other(name, Some(val)) => {
+                write!(f, ";{}=", name)?;
+                write_param_value(f, val.value())
+            }
             Self::Other(name, None) => write!(f, ";{}", name),
         }
     }
+}
+
+fn write_param_value(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        return write!(f, "{}", value);
+    }
+    let needs_quotes = value.is_empty() || value.chars().any(|character| {
+        character.is_ascii_whitespace()
+            || matches!(character, ';' | ',' | '<' | '>' | '"' | '\\')
+    });
+    if !needs_quotes {
+        return write!(f, "{}", value);
+    }
+
+    write!(f, "\"")?;
+    for character in value.chars() {
+        if matches!(character, '"' | '\\') {
+            write!(f, "\\")?;
+        }
+        write!(f, "{}", character)?;
+    }
+    write!(f, "\"")
+}
+
+fn parse_param_value(value: &str) -> Result<String, Error> {
+    let value = value.trim();
+    if !value.starts_with('"') {
+        return Ok(value.to_string());
+    }
+    if value.len() < 2 || !value.ends_with('"') {
+        return Err(Error::ParseError(
+            "unterminated quoted URI parameter value".to_string(),
+        ));
+    }
+
+    let mut parsed = String::with_capacity(value.len() - 2);
+    let mut characters = value[1..value.len() - 1].chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => parsed.push(characters.next().ok_or_else(|| {
+                Error::ParseError("unterminated quoted-pair in URI parameter value".to_string())
+            })?),
+            '"' => return Err(Error::ParseError(
+                "unescaped quote in URI parameter value".to_string(),
+            )),
+            _ => parsed.push(character),
+        }
+    }
+    Ok(parsed)
 }
 
 impl TryFrom<(&str, Option<&str>)> for Param {
@@ -362,9 +414,9 @@ impl FromStr for Param {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim_start_matches(';').trim();
         if let Some(eq) = s.find('=') {
-            let name = &s[..eq];
-            let value = &s[eq + 1..];
-            Param::try_from((name, Some(value)))
+            let name = s[..eq].trim();
+            let value = parse_param_value(&s[eq + 1..])?;
+            Param::try_from((name, Some(value.as_str())))
         } else {
             Param::try_from((s, None))
         }
@@ -599,13 +651,35 @@ pub fn parse_params(s: &str) -> Result<Vec<Param>, Error> {
         return Ok(vec![]);
     }
     let mut params = Vec::new();
-    for part in s.split(';') {
-        let part = part.trim();
-        if part.is_empty() {
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, character) in s.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        let param = part.parse::<Param>()?;
-        params.push(param);
+        match character {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                let part = s[start..index].trim();
+                if !part.is_empty() {
+                    params.push(part.parse::<Param>()?);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return Err(Error::ParseError(
+            "unterminated quoted URI parameter value".to_string(),
+        ));
+    }
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        params.push(part.parse::<Param>()?);
     }
     Ok(params)
 }
@@ -826,7 +900,26 @@ impl ParamsExt for Uri {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_uri, Host, Param, ParamsExt, Scheme};
+    use super::{parse_params, parse_uri, Host, Param, ParamsExt, Scheme};
+
+    #[test]
+    fn uri_param_value_keeps_quoted_semicolons() {
+        let params = parse_params(r#"label="one;two";lr;other=value"#).unwrap();
+        assert_eq!(params.len(), 3);
+        assert!(matches!(&params[0], Param::Other(name, Some(value)) if name.value() == "label" && value.value() == "one;two"));
+        assert_eq!(params[0].to_string(), r#";label="one;two""#);
+        assert!(matches!(params[1], Param::Lr));
+        assert!(matches!(&params[2], Param::Other(name, Some(value)) if name.value() == "other" && value.value() == "value"));
+    }
+
+    #[test]
+    fn uri_param_value_keeps_semicolons_after_escaped_quotes() {
+        let params = parse_params(r#"label="one\";two";lr"#).unwrap();
+        assert_eq!(params.len(), 2);
+        assert!(matches!(&params[0], Param::Other(name, Some(value)) if name.value() == "label" && value.value() == "one\";two"));
+        assert_eq!(params[0].to_string(), r#";label="one\";two""#);
+        assert!(matches!(params[1], Param::Lr));
+    }
 
     #[test]
     fn uri_param_value_keeps_colons_and_following_params() {
