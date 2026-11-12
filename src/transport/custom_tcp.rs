@@ -36,17 +36,22 @@
 //! and the connection ends through that same exit instead of lingering half-dead in the
 //! transport layer, where it would keep being reused.
 //!
-//! # Connections on demand and from a listener (RFC 3261 §18.1.1, §18.2.2)
+//! # Transport selection (RFC 3261 §18.1.1, §18.2.2)
 //!
-//! `TransportLayer::reliable_connection_for` reuses a connection to a remote address or opens
-//! one through the caller's `StreamConnector` and wraps it here (one call at a time, so
-//! callers that need one at the same moment share it); a connection that has ended
-//! ([`CustomTcpConnection::is_closed`]) is not handed out again. Requests the peer sends over
-//! TCP arrive through a [`CustomTcpListenerConnection`]; their responses go back over the
-//! connection they arrived on (§18.2.2), which the server transaction keeps. Not done: if that
-//! connection closes before the response is sent, §18.2.2's fresh connection to the Via's
-//! `received` / sent-by is not opened (the send fails), and `TransportLayer::lookup` of a TCP-
-//! or TLS-typed target still dials an OS socket, not the `StreamConnector`.
+//! A request that would go over UDP but is larger than
+//! `TransportLayer::large_message_threshold` (1300 bytes by default) goes over TCP to the
+//! same remote: `Transaction::send` asks `TransportLayer::reliable_connection_for`, which
+//! reuses a connection to that address or opens one through the caller's `StreamConnector`
+//! and wraps it here (one call at a time, so requests at the same moment share it). If that
+//! fails the request goes over UDP after all (§18.1.1). Either way the top `Via` names the
+//! transport the request actually leaves on. A request bound to a connection that has ended
+//! since ([`CustomTcpConnection::is_closed`]) — an authentication retry, a CANCEL — goes over
+//! a new one to the same remote. Requests the peer sends over TCP arrive through a
+//! [`CustomTcpListenerConnection`]; their responses go back over the connection they arrived
+//! on (§18.2.2), which the server transaction keeps. Not done: if that connection closes
+//! before the response is sent, §18.2.2's fresh connection to the Via's `received` / sent-by
+//! is not opened (the send fails), and `TransportLayer::lookup` of a TCP- or TLS-typed target
+//! still dials an OS socket, not the `StreamConnector`.
 use super::{
     connection::TransportSender,
     stream::{StreamConnection, StreamConnectionInner},

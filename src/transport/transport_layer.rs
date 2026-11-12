@@ -251,6 +251,10 @@ impl TransportLayer {
         *self.inner.stream_connector.write() = None;
     }
 
+    pub(crate) fn has_stream_connector(&self) -> bool {
+        self.inner.stream_connector.read().is_some()
+    }
+
     /// A reliable connection to `remote`'s address (RFC 3261 §18.1.1): the connection already
     /// keyed `TCP <remote address>` if there is one (and it has not ended), otherwise a new
     /// [`CustomTcpConnection`] over a stream from the
@@ -972,6 +976,7 @@ mod stream_tests {
             r#type: Some(Transport::Udp),
             addr: server_addr.into(),
         };
+        assert!(!tl.has_stream_connector());
         let e = tl.reliable_connection_for(&destination).await.unwrap_err();
         assert!(e.to_string().contains("no stream connector"), "{e}");
 
@@ -983,6 +988,7 @@ mod stream_tests {
                 loopback().connect_tcp(remote, WAIT)
             }
         });
+        assert!(tl.has_stream_connector());
 
         let first = match tl.reliable_connection_for(&destination).await.unwrap() {
             SipConnection::CustomTcp(c) => c,
@@ -1018,6 +1024,7 @@ mod stream_tests {
         };
         assert!(tl.reliable_connection_for(&by_name).await.is_err());
         tl.clear_stream_connector();
+        assert!(!tl.has_stream_connector());
         assert!(tl.reliable_connection_for(&other).await.is_err());
 
         // Shutting the transport layer down closes the connection: the peer reads EOF.

@@ -13,6 +13,7 @@ mod test_reliable_provisional;
 mod test_server;
 mod test_server_invite_drop;
 mod test_transaction_states;
+mod test_transport_selection;
 
 pub(super) async fn create_test_endpoint(addr: Option<&str>) -> Result<Endpoint> {
     let token = CancellationToken::new();

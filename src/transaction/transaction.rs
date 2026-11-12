@@ -4,7 +4,7 @@ use super::{SipConnection, TransactionState, TransactionTimer, TransactionType};
 use crate::dialog::DialogId;
 use crate::sip::{
     ContentLength, HasHeaders, Header, HeadersExt, Method, Request, Response, SipMessage,
-    StatusCode, StatusCodeKind,
+    StatusCode, StatusCodeKind, Transport,
 };
 use crate::transaction::key::TransactionRole;
 use crate::transaction::{make_tag, INITIAL_RSEQ};
@@ -337,6 +337,66 @@ pub(crate) fn strip_require_token(headers: &mut Vec<Header>, token: &str) -> boo
     removed
 }
 
+/// The transport a request's top `Via` must name when it goes out over `connection`, for
+/// the connection kinds whose wire transport is unambiguous. `None` leaves the Via alone: a
+/// channel's transport is nominal, a WebSocket connection cannot tell WS from WSS, and
+/// listeners do not send.
+fn via_transport_of(connection: &SipConnection) -> Option<Transport> {
+    match connection {
+        SipConnection::Udp(_) | SipConnection::CustomUdp(_) => Some(Transport::Udp),
+        SipConnection::Tcp(_) | SipConnection::CustomTcp(_) => Some(Transport::Tcp),
+        #[cfg(feature = "rustls")]
+        SipConnection::Tls(_) => Some(Transport::Tls),
+        _ => None,
+    }
+}
+
+/// Byte range of the transport token in one `Via` value (`SIP/2.0/UDP host...`, RFC 3261
+/// §20.42: after the second `/`, with optional whitespace around the slashes, up to the
+/// whitespace before sent-by).
+fn via_transport_span(value: &str) -> Option<(usize, usize)> {
+    let (second_slash, _) = value.match_indices('/').nth(1)?;
+    let rest = &value[second_slash + 1..];
+    let start = second_slash + 1 + (rest.len() - rest.trim_start().len());
+    let len = value[start..]
+        .find(char::is_whitespace)
+        .unwrap_or(value.len() - start);
+    (len > 0).then_some((start, start + len))
+}
+
+/// Make the top `Via` of `msg` name `transport` — the transport the request actually
+/// leaves on (RFC 3261 §18.1.1). Only that token changes: branch, sent-by and every
+/// parameter keep their exact text, so the transaction still matches its responses. A Via
+/// that already names `transport`, or whose transport cannot be read, is left alone.
+pub(crate) fn align_via_transport(msg: &mut Request, transport: Transport) {
+    let Ok(via) = msg.via_header_mut() else {
+        return;
+    };
+    let differs = via.first_value().ok().and_then(|first| {
+        let (start, end) = via_transport_span(first.value())?;
+        let current: Transport = first.value()[start..end].parse().ok()?;
+        Some(current != transport)
+    });
+    if differs != Some(true) {
+        return;
+    }
+    let result = via.update_first_value(|first| {
+        let value = first.value();
+        Ok(match via_transport_span(value) {
+            Some((start, end)) => crate::sip::headers::untyped::Via::new(format!(
+                "{}{}{}",
+                &value[..start],
+                transport,
+                &value[end..]
+            )),
+            None => first,
+        })
+    });
+    if let Err(e) = result {
+        debug!(error = %e, %transport, "cannot set the Via transport");
+    }
+}
+
 /// Remove the `100rel` option tag from every `Require` header (dropping the
 /// header when it becomes empty) and remove every `RSeq` header, without
 /// reformatting anything else. Returns whether anything was removed.
@@ -433,6 +493,8 @@ impl Transaction {
             }
         }
 
+        self.replace_ended_stream().await;
+
         let lookup_result = if self.connection.is_none() {
             let target_uri = self.resolve_target_uri().await?;
 
@@ -471,6 +533,11 @@ impl Transaction {
             }
         }
 
+        // The top Via names the transport the request leaves on. One built from the
+        // endpoint's first address can name another (a TCP listener listed before the UDP
+        // connection actually used, say); fixed before the inspector sees the request.
+        self.align_original_via();
+
         let content_length_header =
             Header::ContentLength(ContentLength::from(self.original.body().len() as u32));
         self.original
@@ -482,6 +549,9 @@ impl Transaction {
         } else {
             self.original.to_owned().into()
         };
+
+        // Before the transition: Timer A is armed from the connection finally chosen.
+        let message = self.select_transport_by_size(message).await;
 
         // Try to send if we have a connection; log errors instead of returning
         // so the transaction always enters the state machine (Calling) and
@@ -498,6 +568,88 @@ impl Transaction {
         // even when transport is unavailable. Timer A will retry the send (and
         // redo the transport lookup if needed), and Timer B handles timeout.
         self.transition(TransactionState::Calling).map(|_| ())
+    }
+
+    /// RFC 3261 §18.1.1 for an outgoing request: one that would go over an unreliable
+    /// transport but whose final size (after the inspector) is above the transport layer's
+    /// `large_message_threshold` goes over TCP to the same destination instead, when a
+    /// stream connector is set; `self.connection` becomes that connection and
+    /// `self.destination` is kept. When no TCP connection can be had the request stays on
+    /// UDP (the RFC's fallback). Either way the top Via of `message` and of `self.original`
+    /// (which retransmissions, the non-2xx ACK and authentication retries are built from) is
+    /// then made to name the transport of the connection used.
+    async fn select_transport_by_size(&mut self, mut message: SipMessage) -> SipMessage {
+        let transport_layer = &self.endpoint_inner.transport_layer;
+        let unreliable = self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| !connection.is_reliable());
+        if unreliable && transport_layer.has_stream_connector() {
+            let size = message.to_bytes().len();
+            let threshold = transport_layer.large_message_threshold();
+            if size > threshold {
+                // Where the UDP send would go: the resolved destination, else the Request-URI.
+                let target = self.destination.clone().or_else(|| {
+                    SipConnection::get_destination(&message)
+                        .ok()
+                        .map(SipAddr::from)
+                });
+                match target {
+                    Some(target) => match transport_layer.reliable_connection_for(&target).await {
+                        Ok(connection) => {
+                            debug!(key = %self.key, size, threshold, %connection, "request above the UDP size threshold; sending it over TCP (RFC 3261 §18.1.1)");
+                            self.connection = Some(connection);
+                        }
+                        Err(e) => {
+                            warn!(key = %self.key, size, threshold, error = %e, "no TCP connection for a large request; sending it over UDP (RFC 3261 §18.1.1)");
+                        }
+                    },
+                    None => {
+                        warn!(key = %self.key, size, threshold, "large request without a destination address; sending it over UDP");
+                    }
+                }
+            }
+        }
+        if let Some(transport) = self.connection.as_ref().and_then(via_transport_of) {
+            if let SipMessage::Request(request) = &mut message {
+                align_via_transport(request, transport);
+            }
+            align_via_transport(&mut self.original, transport);
+        }
+        message
+    }
+
+    /// A request bound to a stream connection that has ended since it was chosen — a CANCEL
+    /// riding its INVITE's connection (RFC 3261 §9.1), an authentication retry riding the
+    /// connection of the request it retries — goes over a new connection to the same remote
+    /// (RFC 3261 §18.1.1: a closed connection is reopened) rather than into the dead one,
+    /// where nothing but Timer B would end the transaction. When no new connection can be
+    /// had, the request is unbound and takes the transport lookup like any other.
+    async fn replace_ended_stream(&mut self) {
+        let remote = match self.connection.as_ref() {
+            Some(SipConnection::CustomTcp(stream)) if stream.is_closed() => {
+                crate::transport::stream::StreamConnection::get_remote_addr(stream).clone()
+            }
+            _ => return,
+        };
+        let transport_layer = &self.endpoint_inner.transport_layer;
+        match transport_layer.reliable_connection_for(&remote).await {
+            Ok(connection) => {
+                debug!(key = %self.key, %connection, "the request's TCP connection has ended; sending it over a new one");
+                self.connection = Some(connection);
+            }
+            Err(e) => {
+                warn!(key = %self.key, %remote, error = %e, "the request's TCP connection has ended and no new one could be opened; looking up a transport");
+                self.connection = None;
+            }
+        }
+    }
+
+    /// Make the top Via of `self.original` name the transport of `self.connection`.
+    fn align_original_via(&mut self) {
+        if let Some(transport) = self.connection.as_ref().and_then(via_transport_of) {
+            align_via_transport(&mut self.original, transport);
+        }
     }
 
     /// Resolve the target URI for sending a request.
@@ -1457,6 +1609,7 @@ impl Transaction {
                                 {
                                     self.connection.replace(connection);
                                     self.destination.replace(resolved_addr);
+                                    self.align_original_via();
                                 }
                             }
                         }
