@@ -232,6 +232,10 @@ pub struct TlsConfig {
     pub ca_certs: Option<Vec<u8>>,
     // SNI hostname for TLS client connections (overrides the hostname derived from the remote address)
     pub sni_hostname: Option<String>,
+    // Server-certificate verifier for client connections (None = the root store). Carried in
+    // the config so connections the transport layer opens on its own (lookup) verify the same
+    // way as ones the application opened.
+    pub custom_verifier: Option<Arc<dyn ServerCertVerifier>>,
 }
 
 fn parse_private_key(key_data: &[u8]) -> Result<pki_types::PrivateKeyDer<'static>> {
@@ -507,7 +511,8 @@ impl TlsConnection {
                 .with_no_client_auth(),
         };
 
-        if let Some(verifier) = custom_verifier {
+        let verifier = custom_verifier.or_else(|| tls_config.and_then(|c| c.custom_verifier.clone()));
+        if let Some(verifier) = verifier {
             client_config.dangerous().set_certificate_verifier(verifier);
         }
 
