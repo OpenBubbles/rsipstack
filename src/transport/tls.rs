@@ -11,7 +11,9 @@ use rustls::crypto::CryptoProvider;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::{fmt, fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{fmt, fmt::Debug, net::SocketAddr, sync::Arc, time::Duration};
+#[cfg(target_vendor = "apple")]
+use std::os::fd::AsRawFd;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{
     rustls::{pki_types, pki_types::pem::PemObject, ClientConfig, RootCertStore, ServerConfig},
@@ -236,6 +238,51 @@ pub struct TlsConfig {
     // the config so connections the transport layer opens on its own (lookup) verify the same
     // way as ones the application opened.
     pub custom_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    // Maximum time transmitted data may remain unacknowledged before the TCP connection is
+    // dropped. Uses TCP_USER_TIMEOUT where available and TCP_RXT_CONNDROPTIME on Apple systems.
+    pub tcp_failure_timeout: Option<Duration>,
+}
+
+fn set_tcp_failure_timeout(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "cygwin",
+    ))]
+    {
+        return socket2::SockRef::from(stream).set_tcp_user_timeout(Some(timeout));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    {
+        // TCP_RXT_CONNDROPTIME is the Apple equivalent: stop retransmitting and drop the
+        // established connection after this many seconds.
+        const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+        let seconds = timeout.as_secs().max(1).min(i32::MAX as u64) as libc::c_int;
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                TCP_RXT_CONNDROPTIME,
+                &seconds as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&seconds) as libc::socklen_t,
+            )
+        };
+        return if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
+    }
+
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "cygwin",
+        target_vendor = "apple",
+    )))]
+    {
+        let _ = (stream, timeout);
+        Ok(())
+    }
 }
 
 fn parse_private_key(key_data: &[u8]) -> Result<pki_types::PrivateKeyDer<'static>> {
@@ -542,6 +589,9 @@ impl TlsConnection {
             .to_owned();
 
         let stream = TcpStream::connect(socket_addr).await?;
+        if let Some(timeout) = tls_config.and_then(|config| config.tcp_failure_timeout) {
+            set_tcp_failure_timeout(&stream, timeout)?;
+        }
         let local_addr = SipAddr {
             r#type: Some(crate::sip::transport::Transport::Tls),
             addr: stream.local_addr()?.into(),
