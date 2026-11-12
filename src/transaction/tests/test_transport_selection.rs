@@ -2,8 +2,8 @@
 //! than the transport layer's threshold goes over TCP to the same destination (through the
 //! stream connector), falls back to UDP when no TCP connection can be had, and the top Via
 //! always names the transport actually used. And what rides on that: a request bound to a
-//! connection that has ended goes over a new one, and a CANCEL follows its INVITE onto TCP
-//! (§9.1).
+//! connection that has ended goes over a new one, a CANCEL follows its INVITE onto TCP
+//! (§9.1), and a REGISTER sent over TCP leaves the line's Contact alone.
 use crate::sip::headers::*;
 use crate::sip::{prelude::HeadersExt, Method, Request, SipMessage, Transport, Uri, Version};
 use crate::transaction::endpoint::Endpoint;
@@ -296,6 +296,72 @@ async fn a_request_bound_to_an_ended_tcp_connection_goes_over_a_new_one() {
     assert_eq!(calls.lock().as_slice(), &[peer, peer], "a second connect to the same remote");
     udp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     assert!(udp.recv_from(&mut [0u8; 64]).is_err(), "nothing went over UDP");
+}
+
+/// A REGISTER too large for UDP goes over a TCP connection of its own, and the registrar
+/// (RFC 3581) fills the Via's `rport` with that connection's ephemeral source port. That
+/// port is not where the UA can be reached — nothing listens there — so the registration's
+/// NAT discovery must not move the Contact to it: the retry after the 401 (and every later
+/// REGISTER) still names the Contact the line set.
+#[tokio::test]
+async fn a_register_over_its_own_tcp_connection_keeps_the_lines_contact() {
+    use crate::dialog::{authenticate::Credential, registration::Registration};
+
+    let (_udp, tcp, peer) = udp_and_tcp_on_one_port();
+    let endpoint = endpoint_with_udp_line(peer);
+    let line_port = endpoint.get_addrs()[0].addr.port.as_ref().map(|p| p.value()).unwrap();
+    let transport_layer = &endpoint.inner.transport_layer;
+    transport_layer.set_stream_connector(recording_connector(&Arc::default()));
+    // Every REGISTER is "large".
+    transport_layer.set_large_message_threshold(200);
+    let serving = endpoint.inner.clone();
+    tokio::spawn(async move { serving.serve().await });
+
+    let peer_side = tokio::task::spawn_blocking(move || {
+        let stream = accept_within(&tcp, WAIT);
+        let source_port = stream.peer_addr().unwrap().port();
+        let mut peer = Peer::new(stream);
+        // RFC 3581: the registrar fills in rport with the source port it saw.
+        let with_rport = |request: &str| request.replacen(";rport", &format!(";rport={source_port}"), 1);
+        let first = peer.read_message();
+        let challenge = vec![r#"WWW-Authenticate: Digest realm="example.com", nonce="n0nce", algorithm=MD5"#.to_string()];
+        peer.write(reply(&with_rport(&first), "401 Unauthorized", "registrar", &challenge).as_bytes());
+        let second = peer.read_message();
+        let contact = vec![format!("Contact: {};expires=600", header(&second, "Contact").unwrap())];
+        peer.write(reply(&with_rport(&second), "200 OK", "registrar", &contact).as_bytes());
+        (first, second, source_port)
+    });
+
+    let mut registration = Registration::new(
+        endpoint.inner.clone(),
+        Some(Credential {
+            username: "alice".into(),
+            password: "secret".into(),
+            realm: Some("example.com".into()),
+        }),
+    );
+    let contact_uri = format!("sip:alice@127.0.0.1:{line_port}");
+    registration.contact = Some(crate::sip::typed::Contact {
+        display_name: None,
+        uri: Uri::try_from(contact_uri.as_str()).unwrap(),
+        params: vec![],
+    });
+    let server = Uri::try_from(format!("sip:{peer};transport=udp").as_str()).unwrap();
+    let response = timeout(WAIT, registration.register(server, Some(600)))
+        .await
+        .expect("the registration completes")
+        .expect("REGISTER succeeds");
+    assert_eq!(response.status_code, crate::sip::StatusCode::OK);
+
+    let (first, second, source_port) = timeout(WAIT, peer_side).await.unwrap().unwrap();
+    assert_ne!(source_port, line_port, "the TCP connection has a port of its own");
+    for register in [&first, &second] {
+        assert!(header(register, "Via").unwrap().starts_with("SIP/2.0/TCP "), "{register}");
+        assert_eq!(header(register, "Contact"), Some(format!("<{contact_uri}>").as_str()), "{register}");
+    }
+    assert!(header(&second, "Authorization").is_some(), "{second}");
+    let kept = registration.contact.as_ref().unwrap().uri.to_string();
+    assert_eq!(kept, contact_uri, "later REGISTERs keep the line's Contact too");
 }
 
 /// `request`'s answer with `status` (e.g. `"180 Ringing"`): its Via, From, Call-ID and CSeq,

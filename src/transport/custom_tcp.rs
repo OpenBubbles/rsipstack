@@ -47,7 +47,9 @@
 //! transport the request actually leaves on. A request bound to a connection that has ended
 //! since ([`CustomTcpConnection::is_closed`]) — an authentication retry, a CANCEL — goes over
 //! a new one to the same remote. A CANCEL rides the connection its INVITE went out on,
-//! whatever the dialog's route set (§9.1). Requests the peer sends over TCP arrive through a
+//! whatever the dialog's route set (§9.1). A REGISTER's response over such a connection
+//! teaches the registration nothing about its public address: its `rport` is the
+//! connection's ephemeral port. Requests the peer sends over TCP arrive through a
 //! [`CustomTcpListenerConnection`]; their responses go back over the connection they arrived
 //! on (§18.2.2), which the server transaction keeps. Not done: if that connection closes
 //! before the response is sent, §18.2.2's fresh connection to the Via's `received` / sent-by

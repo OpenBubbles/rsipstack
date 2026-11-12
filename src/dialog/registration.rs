@@ -16,6 +16,16 @@ use crate::{
 };
 use tracing::debug;
 
+/// Whether the top Via of a response to `tx` says where this UA can be reached (`received` /
+/// `rport`, the NAT discovery below). Not when the request went over a stream connection of
+/// its own — a [`SipConnection::CustomTcp`] opened because the REGISTER was too large for the
+/// line's UDP (RFC 3261 §18.1.1): `rport` is then that connection's ephemeral source port,
+/// where nothing listens, and a Contact moved there would cut the line off from incoming
+/// requests.
+fn reveals_public_address(tx: &Transaction) -> bool {
+    !matches!(tx.connection, Some(SipConnection::CustomTcp(_)))
+}
+
 /// SIP Registration Client
 ///
 /// `Registration` provides functionality for SIP user agent registration
@@ -465,11 +475,15 @@ impl Registration {
                         continue;
                     }
                     StatusCode::ProxyAuthenticationRequired | StatusCode::Unauthorized => {
-                        let received = resp.via_header().ok().and_then(|via| {
-                            SipConnection::parse_target_from_via(via)
-                                .ok()
-                                .map(|(_, host_with_port)| host_with_port)
-                        });
+                        let received = if reveals_public_address(&tx) {
+                            resp.via_header().ok().and_then(|via| {
+                                SipConnection::parse_target_from_via(via)
+                                    .ok()
+                                    .map(|(_, host_with_port)| host_with_port)
+                            })
+                        } else {
+                            self.public_address.clone()
+                        };
                         if self.public_address != received {
                             debug!(
                                 old = ?self.public_address,
@@ -529,11 +543,15 @@ impl Registration {
                     }
                     StatusCode::OK => {
                         // Check if server indicated our public IP in Via header
-                        let received = resp.via_header().ok().and_then(|via| {
-                            SipConnection::parse_target_from_via(via)
-                                .ok()
-                                .map(|(_, host_with_port)| host_with_port)
-                        });
+                        let received = if reveals_public_address(&tx) {
+                            resp.via_header().ok().and_then(|via| {
+                                SipConnection::parse_target_from_via(via)
+                                    .ok()
+                                    .map(|(_, host_with_port)| host_with_port)
+                            })
+                        } else {
+                            self.public_address.clone()
+                        };
 
                         // Do NOT adopt the Contact from the 200 OK response.
                         // The response may contain Contact bindings from OTHER
