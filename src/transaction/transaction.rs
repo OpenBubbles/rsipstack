@@ -1197,6 +1197,36 @@ impl Transaction {
                 }
                 TransactionEvent::Terminate(key) => {
                     debug!(%key, "received terminate event");
+                    if matches!(self.state, TransactionState::Nothing) {
+                        // Nothing has been sent yet; whatever prompted this does not concern
+                        // this transaction (its request will go out on whatever transport is
+                        // current when it is sent).
+                        debug!(%key, "terminate before the request was sent; ignored");
+                        continue;
+                    }
+                    // Terminated from outside while a client transaction still awaits its
+                    // final response: the transport failed under it. RFC 3261 §8.1.3.1 has
+                    // the TU treat that as a 503, so hand it one built from the request; the
+                    // state machine then ends the transaction as for any final response.
+                    let awaiting_final = matches!(
+                        self.state,
+                        TransactionState::Calling
+                            | TransactionState::Trying
+                            | TransactionState::Proceeding
+                    );
+                    if matches!(self.role(), TransactionRole::Client) && awaiting_final {
+                        let failure = self.endpoint_inner.make_response(
+                            &self.original,
+                            StatusCode::ServiceUnavailable,
+                            None,
+                        );
+                        match self.inform_tu_response(failure) {
+                            Ok(()) => continue,
+                            Err(e) => {
+                                debug!(key = %self.key, error = %e, "transport failure report failed")
+                            }
+                        }
+                    }
                     return None;
                 }
             }
