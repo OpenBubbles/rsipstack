@@ -689,7 +689,25 @@ impl InviteDialog {
             }
         }
 
-        // Not confirmed — only the UAS side drives the INVITE transaction here.
+        // Not confirmed. An UPDATE is allowed on an early dialog from either side (RFC 3311 §5.1)
+        // and is handled as on a confirmed one: `DialogState::Updated`, answered through its
+        // handle. Left unanswered, the peer's UPDATE times out and the peer ends the call
+        // (RFC 3311 §5.3). `WaitAck` is a UAS that has sent its 2xx: the dialog is established
+        // and the ACK is still on its way.
+        let early = matches!(
+            *self.inner.state.lock(),
+            DialogState::Early(..) | DialogState::WaitAck(..)
+        );
+        if tx.original.method == Method::Update && early {
+            debug!(
+                id = %self.id(),
+                role = ?self.role(),
+                "received update before the dialog is confirmed"
+            );
+            return self.handle_update(tx).await;
+        }
+
+        // Only the UAS side drives the INVITE transaction here.
         if self.role() == TransactionRole::Server {
             match tx.original.method {
                 Method::Invite => return self.handle_invite(tx).await,

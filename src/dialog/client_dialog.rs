@@ -584,6 +584,7 @@ impl ClientInviteDialog {
             .compare_exchange(remote_seq, cseq, Ordering::Relaxed, Ordering::Relaxed)
             .ok();
 
+        let early = matches!(*self.inner.state.lock(), DialogState::Early(..));
         if self.inner.is_confirmed() {
             match tx.original.method {
                 crate::sip::Method::Invite => return self.handle_reinvite(tx).await,
@@ -604,6 +605,11 @@ impl ClientInviteDialog {
                     ));
                 }
             }
+        } else if tx.original.method == crate::sip::Method::Update && early {
+            // An UPDATE on an early dialog (RFC 3311 §5.1) is handled as on a confirmed one, as
+            // in `InviteDialog::handle`.
+            debug!(id = %self.id(), "received update before the dialog is confirmed");
+            return self.handle_update(tx).await;
         } else {
             debug!(
                 id = %self.id(),

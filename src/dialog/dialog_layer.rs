@@ -439,8 +439,16 @@ impl DialogLayer {
             .collect::<Vec<_>>()
     }
 
+    /// The dialog with this ID (RFC 3261 §12: Call-ID, local tag, remote tag).
+    ///
+    /// A UAC INVITE dialog stays filed under the ID it was registered with -- before any
+    /// response, so with no remote tag -- until a 2xx (`do_invite`, `do_invite_async`). A 1xx
+    /// with a To tag gives it its remote tag before that (§12.1.2), making it an early dialog
+    /// the UAS can send requests on (an UPDATE, RFC 3311 §5.1). Such a dialog is found by its
+    /// current ID too.
     pub fn get_dialog(&self, id: &DialogId) -> Option<Dialog> {
         self.get_dialog_with(&id.to_string())
+            .or_else(|| self.get_early_client_invite(id))
     }
 
     pub fn get_dialog_with(&self, id: &String) -> Option<Dialog> {
@@ -465,6 +473,21 @@ impl DialogLayer {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A UAC INVITE dialog whose current ID is `id` while the registry still holds it under its
+    /// registration ID (see [`Self::get_dialog`]). In-dialog requests carry both tags; without
+    /// them nothing is looked up.
+    fn get_early_client_invite(&self, id: &DialogId) -> Option<Dialog> {
+        if id.local_tag.is_empty() || id.remote_tag.is_empty() {
+            return None;
+        }
+        let dialog = self
+            .get_client_dialog_by_call_id(&id.call_id)
+            .into_iter()
+            .find(|dlg| dlg.role() == TransactionRole::Client && dlg.id() == *id)?;
+        debug!(%id, "matched a client invite dialog by its current id");
+        Some(Dialog::Invite(dialog))
     }
 
     /// Restore a dialog from persisted snapshot.

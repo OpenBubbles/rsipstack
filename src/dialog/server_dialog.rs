@@ -758,6 +758,10 @@ impl ServerInviteDialog {
             }
         }
 
+        let early = matches!(
+            *self.inner.state.lock(),
+            DialogState::Early(..) | DialogState::WaitAck(..)
+        );
         match tx.original.method {
             crate::sip::Method::Invite => return self.handle_invite(tx).await,
             crate::sip::Method::PRack => return self.handle_prack(tx).await,
@@ -771,6 +775,12 @@ impl ServerInviteDialog {
             // Accept BYE even in WaitAck state — remote may tear down call
             // before ACK arrives (common with SIP proxies)
             crate::sip::Method::Bye => return self.handle_bye(tx).await,
+            // An UPDATE on an early dialog (RFC 3311 §5.1), or after our 2xx before the ACK, is
+            // handled as on a confirmed one, as in `InviteDialog::handle`.
+            crate::sip::Method::Update if early => {
+                debug!(id = %self.id(), "received update before the dialog is confirmed");
+                return self.handle_update(tx).await;
+            }
             _ => {
                 // ignore other requests in non-confirmed state
                 Ok(())
