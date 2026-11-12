@@ -1178,6 +1178,19 @@ impl DialogInner {
         Some(conn)
     }
 
+    /// The connection for this dialog's CANCEL. RFC 3261 §9.1: "The destination address,
+    /// port, and transport for the CANCEL MUST be identical to those used to send the
+    /// original request". So when the INVITE went out over a reliable connection — on a UDP
+    /// line, one it took because it was too large for a datagram (RFC 3261 §18.1.1) — the
+    /// CANCEL rides that connection whatever the route set, which a 1xx with Record-Route
+    /// has usually installed by now and which would send the small CANCEL over UDP. After
+    /// an INVITE that went over UDP, `None`: the CANCEL takes the same transport lookup.
+    fn cancel_connection(&self) -> Option<SipConnection> {
+        let conn = self.server_connection.lock().clone()?;
+        let flow_ended = conn.cancel_token().is_some_and(|token| token.is_cancelled());
+        (conn.is_reliable() && !flow_ended).then_some(conn)
+    }
+
     /// Test-visible wrapper around [`Self::resolve_affinity_connection`].
     #[cfg(test)]
     pub fn test_resolve_affinity_connection(&self) -> Option<SipConnection> {
@@ -1204,8 +1217,13 @@ impl DialogInner {
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: deliver in-dialog requests to the remote
-        // UA over the same reliable connection the initial request used.
-        let affinity_connection = self.resolve_affinity_connection();
+        // UA over the same reliable connection the initial request used. A
+        // CANCEL goes where its INVITE went (RFC 3261 §9.1).
+        let affinity_connection = if method == Method::Cancel {
+            self.cancel_connection()
+        } else {
+            self.resolve_affinity_connection()
+        };
         let mut tx = Transaction::new_client(
             key,
             request,

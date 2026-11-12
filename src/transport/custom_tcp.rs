@@ -36,7 +36,7 @@
 //! and the connection ends through that same exit instead of lingering half-dead in the
 //! transport layer, where it would keep being reused.
 //!
-//! # Transport selection (RFC 3261 §18.1.1, §18.2.2)
+//! # Transport selection (RFC 3261 §18.1.1, §18.2.2, §9.1)
 //!
 //! A request that would go over UDP but is larger than
 //! `TransportLayer::large_message_threshold` (1300 bytes by default) goes over TCP to the
@@ -46,7 +46,8 @@
 //! fails the request goes over UDP after all (§18.1.1). Either way the top `Via` names the
 //! transport the request actually leaves on. A request bound to a connection that has ended
 //! since ([`CustomTcpConnection::is_closed`]) — an authentication retry, a CANCEL — goes over
-//! a new one to the same remote. Requests the peer sends over TCP arrive through a
+//! a new one to the same remote. A CANCEL rides the connection its INVITE went out on,
+//! whatever the dialog's route set (§9.1). Requests the peer sends over TCP arrive through a
 //! [`CustomTcpListenerConnection`]; their responses go back over the connection they arrived
 //! on (§18.2.2), which the server transaction keeps. Not done: if that connection closes
 //! before the response is sent, §18.2.2's fresh connection to the Via's `received` / sent-by

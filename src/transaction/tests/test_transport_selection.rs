@@ -2,7 +2,8 @@
 //! than the transport layer's threshold goes over TCP to the same destination (through the
 //! stream connector), falls back to UDP when no TCP connection can be had, and the top Via
 //! always names the transport actually used. And what rides on that: a request bound to a
-//! connection that has ended goes over a new one.
+//! connection that has ended goes over a new one, and a CANCEL follows its INVITE onto TCP
+//! (§9.1).
 use crate::sip::headers::*;
 use crate::sip::{prelude::HeadersExt, Method, Request, SipMessage, Transport, Uri, Version};
 use crate::transaction::endpoint::Endpoint;
@@ -295,6 +296,103 @@ async fn a_request_bound_to_an_ended_tcp_connection_goes_over_a_new_one() {
     assert_eq!(calls.lock().as_slice(), &[peer, peer], "a second connect to the same remote");
     udp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     assert!(udp.recv_from(&mut [0u8; 64]).is_err(), "nothing went over UDP");
+}
+
+/// `request`'s answer with `status` (e.g. `"180 Ringing"`): its Via, From, Call-ID and CSeq,
+/// its To with `to_tag` added, then `extra` header lines.
+fn reply(request: &str, status: &str, to_tag: &str, extra: &[String]) -> String {
+    let mut reply = format!("SIP/2.0 {status}\r\n");
+    for line in request.lines().skip(1) {
+        let name = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        match name.as_str() {
+            "via" | "from" | "call-id" | "cseq" => reply.push_str(&format!("{line}\r\n")),
+            "to" => reply.push_str(&format!("{line};tag={to_tag}\r\n")),
+            _ => {}
+        }
+    }
+    for line in extra {
+        reply.push_str(&format!("{line}\r\n"));
+    }
+    reply.push_str("Content-Length: 0\r\n\r\n");
+    reply
+}
+
+/// RFC 3261 §9.1: "The destination address, port, and transport for the CANCEL MUST be
+/// identical to those used to send the original request", and its single Via matches the
+/// INVITE's top Via. The INVITE was too large for UDP and went over TCP; the 180 that came
+/// back carries a Record-Route, so the dialog has a route set and would route its other
+/// requests through the transport lookup (the UDP line). The CANCEL must not: it rides the
+/// INVITE's TCP connection with the INVITE's Via, and the 487's ACK follows on it too.
+#[tokio::test]
+async fn a_cancel_goes_over_the_tcp_connection_its_large_invite_used() {
+    use crate::dialog::dialog::DialogState;
+    use crate::dialog::{dialog_layer::DialogLayer, invitation::InviteOption};
+
+    let (udp, tcp, peer) = udp_and_tcp_on_one_port();
+    let endpoint = endpoint_with_udp_line(peer);
+    let calls = Arc::default();
+    endpoint
+        .inner
+        .transport_layer
+        .set_stream_connector(recording_connector(&calls));
+    let serving = endpoint.inner.clone();
+    tokio::spawn(async move { serving.serve().await });
+
+    let peer_side = tokio::task::spawn_blocking(move || {
+        let mut peer = Peer::new(accept_within(&tcp, WAIT));
+        let invite = peer.read_message();
+        let record_route = vec![
+            format!("Record-Route: <sip:{peer_addr};lr>", peer_addr = peer.local_addr()),
+            format!("Contact: <sip:bob@{peer_addr}>", peer_addr = peer.local_addr()),
+        ];
+        peer.write(reply(&invite, "180 Ringing", "callee", &record_route).as_bytes());
+        let cancel = peer.read_message();
+        peer.write(reply(&cancel, "200 OK", "callee", &[]).as_bytes());
+        peer.write(reply(&invite, "487 Request Terminated", "callee", &[]).as_bytes());
+        let ack = peer.read_message();
+        (invite, cancel, ack)
+    });
+
+    let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
+    let option = InviteOption {
+        caller: Uri::try_from("sip:alice@example.com").unwrap(),
+        callee: Uri::try_from(format!("sip:bob@{peer};transport=udp").as_str()).unwrap(),
+        contact: Uri::try_from("sip:alice@127.0.0.1:5060").unwrap(),
+        content_type: Some("application/sdp".into()),
+        offer: Some(vec![b'v'; 2000]),
+        ..Default::default()
+    };
+    let (states, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dialog, _invite) = dialog_layer.do_invite_async(option, states).unwrap();
+    loop {
+        match timeout(WAIT, state_rx.recv()).await.expect("the 180 arrives").unwrap() {
+            DialogState::Early(..) => break,
+            DialogState::Terminated(_, reason) => panic!("dialog ended before the 180: {reason:?}"),
+            _ => {}
+        }
+    }
+    assert!(
+        !dialog.snapshot().route_set.is_empty(),
+        "the 180's Record-Route gave the dialog a route set"
+    );
+    timeout(WAIT, dialog.cancel())
+        .await
+        .expect("the CANCEL is answered")
+        .expect("the CANCEL succeeds");
+
+    let (invite, cancel, ack) = timeout(WAIT, peer_side).await.unwrap().unwrap();
+    assert!(invite.starts_with("INVITE "), "{invite}");
+    assert!(cancel.starts_with("CANCEL "), "{cancel}");
+    let invite_via = header(&invite, "Via").unwrap();
+    assert!(invite_via.starts_with("SIP/2.0/TCP "), "{invite_via}");
+    assert_eq!(header(&cancel, "Via"), Some(invite_via), "the CANCEL's Via is the INVITE's");
+    assert!(ack.starts_with("ACK "), "{ack}");
+    assert_eq!(header(&ack, "CSeq").map(|c| c.ends_with("ACK")), Some(true), "{ack}");
+    assert_eq!(calls.lock().len(), 1, "one TCP connection carried all of it");
+    udp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut buf = [0u8; 2048];
+    let stray = udp.recv_from(&mut buf).map(|(n, _)| String::from_utf8_lossy(&buf[..n]).to_string());
+    assert!(stray.is_err(), "nothing went over UDP: {stray:?}");
 }
 
 fn request_with_vias(vias: &[&str]) -> Request {
