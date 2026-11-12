@@ -1,4 +1,5 @@
 use super::{sip_addr::SipAddr, stream::StreamConnection, tcp::TcpConnection, udp::UdpConnection, custom_udp::CustomUdpConnection};
+use super::custom_tcp::{CustomTcpConnection, CustomTcpListenerConnection};
 use crate::sip::headers::untyped::Via;
 use crate::sip::{
     prelude::{HeadersExt, ToTypedHeader},
@@ -154,6 +155,11 @@ pub enum SipConnection {
     CustomUdp(CustomUdpConnection),
     Tcp(TcpConnection),
     TcpListener(TcpListenerConnection),
+    /// TCP over a caller-supplied stream (e.g. inside an ePDG tunnel), see [`CustomTcpConnection`].
+    CustomTcp(CustomTcpConnection),
+    /// Accepts [`SipConnection::CustomTcp`] connections on a caller-supplied listener, see
+    /// [`CustomTcpListenerConnection`].
+    CustomTcpListener(CustomTcpListenerConnection),
     #[cfg(feature = "rustls")]
     Tls(TlsConnection),
     #[cfg(feature = "rustls")]
@@ -168,7 +174,10 @@ impl SipConnection {
     pub fn transport(&self) -> Transport {
         match self {
             SipConnection::Udp(_) | SipConnection::CustomUdp(_) => Transport::Udp,
-            SipConnection::Tcp(_) | SipConnection::TcpListener(_) => Transport::Tcp,
+            SipConnection::Tcp(_)
+            | SipConnection::TcpListener(_)
+            | SipConnection::CustomTcp(_)
+            | SipConnection::CustomTcpListener(_) => Transport::Tcp,
             #[cfg(feature = "rustls")]
             SipConnection::Tls(_) | SipConnection::TlsListener(_) => Transport::Tls,
             #[cfg(feature = "websocket")]
@@ -189,6 +198,8 @@ impl SipConnection {
             SipConnection::Udp(transport) => transport.cancel_token(),
             SipConnection::CustomUdp(transport) => transport.cancel_token(),
             SipConnection::Tcp(transport) => transport.cancel_token(),
+            SipConnection::CustomTcp(transport) => transport.cancel_token(),
+            SipConnection::CustomTcpListener(transport) => transport.cancel_token(),
             #[cfg(feature = "rustls")]
             SipConnection::Tls(transport) => transport.cancel_token(),
             #[cfg(feature = "websocket")]
@@ -203,6 +214,8 @@ impl SipConnection {
             SipConnection::CustomUdp(transport) => transport.get_addr(),
             SipConnection::Tcp(transport) => transport.get_addr(),
             SipConnection::TcpListener(transport) => transport.get_addr(),
+            SipConnection::CustomTcp(transport) => transport.get_addr(),
+            SipConnection::CustomTcpListener(transport) => transport.get_addr(),
             #[cfg(feature = "rustls")]
             SipConnection::Tls(transport) => transport.get_addr(),
             #[cfg(feature = "rustls")]
@@ -221,6 +234,8 @@ impl SipConnection {
             SipConnection::CustomUdp(transport) => transport.get_remote_addr(),
             SipConnection::Tcp(transport) => Some(transport.get_remote_addr()),
             SipConnection::TcpListener(_) => None,
+            SipConnection::CustomTcp(transport) => Some(transport.get_remote_addr()),
+            SipConnection::CustomTcpListener(_) => None,
             #[cfg(feature = "rustls")]
             SipConnection::Tls(transport) => Some(transport.get_remote_addr()),
             #[cfg(feature = "rustls")]
@@ -240,6 +255,11 @@ impl SipConnection {
             SipConnection::Tcp(transport) => transport.send_message(msg).await,
             SipConnection::TcpListener(_) => {
                 debug!("SipConnection::send: TcpListener cannot send messages");
+                Ok(())
+            }
+            SipConnection::CustomTcp(transport) => transport.send_message(msg).await,
+            SipConnection::CustomTcpListener(_) => {
+                debug!("SipConnection::send: CustomTcpListener cannot send messages");
                 Ok(())
             }
             #[cfg(feature = "rustls")]
@@ -268,6 +288,11 @@ impl SipConnection {
                 debug!("SipConnection::serve_loop: TcpListener does not have serve_loop");
                 Ok(())
             }
+            SipConnection::CustomTcp(transport) => transport.serve_loop(sender).await,
+            SipConnection::CustomTcpListener(_) => {
+                debug!("SipConnection::serve_loop: CustomTcpListener does not have serve_loop");
+                Ok(())
+            }
             #[cfg(feature = "rustls")]
             SipConnection::Tls(transport) => transport.serve_loop(sender).await,
             #[cfg(feature = "rustls")]
@@ -292,6 +317,8 @@ impl SipConnection {
             SipConnection::CustomUdp(_) => Ok(()),
             SipConnection::Tcp(transport) => transport.close().await,
             SipConnection::TcpListener(transport) => transport.close().await,
+            SipConnection::CustomTcp(transport) => transport.close().await,
+            SipConnection::CustomTcpListener(transport) => transport.close().await,
             #[cfg(feature = "rustls")]
             SipConnection::Tls(transport) => transport.close().await,
             #[cfg(feature = "rustls")]
@@ -452,6 +479,8 @@ impl fmt::Display for SipConnection {
             SipConnection::CustomUdp(t) => write!(f, "UDP(custom) {}", t),
             SipConnection::Tcp(t) => write!(f, "TCP {}", t),
             SipConnection::TcpListener(t) => write!(f, "TCP LISTEN {}", t),
+            SipConnection::CustomTcp(t) => write!(f, "TCP(custom) {}", t),
+            SipConnection::CustomTcpListener(t) => write!(f, "TCP(custom) LISTEN {}", t),
             #[cfg(feature = "rustls")]
             SipConnection::Tls(t) => write!(f, "{}", t),
             #[cfg(feature = "rustls")]
@@ -491,6 +520,18 @@ impl From<TcpConnection> for SipConnection {
 impl From<TcpListenerConnection> for SipConnection {
     fn from(connection: TcpListenerConnection) -> Self {
         SipConnection::TcpListener(connection)
+    }
+}
+
+impl From<CustomTcpConnection> for SipConnection {
+    fn from(connection: CustomTcpConnection) -> Self {
+        SipConnection::CustomTcp(connection)
+    }
+}
+
+impl From<CustomTcpListenerConnection> for SipConnection {
+    fn from(connection: CustomTcpListenerConnection) -> Self {
+        SipConnection::CustomTcpListener(connection)
     }
 }
 
