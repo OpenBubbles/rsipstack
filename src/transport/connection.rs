@@ -1,4 +1,4 @@
-use super::{sip_addr::SipAddr, stream::StreamConnection, tcp::TcpConnection, udp::UdpConnection};
+use super::{sip_addr::SipAddr, stream::StreamConnection, tcp::TcpConnection, udp::UdpConnection, custom_udp::CustomUdpConnection};
 use crate::sip::headers::untyped::Via;
 use crate::sip::{
     prelude::{HeadersExt, ToTypedHeader},
@@ -150,6 +150,8 @@ pub const MAX_UDP_BUF_SIZE: usize = 8192;
 pub enum SipConnection {
     Channel(ChannelConnection),
     Udp(UdpConnection),
+    /// UDP over a caller-supplied socket (e.g. inside an ePDG tunnel), see [`CustomUdpConnection`].
+    CustomUdp(CustomUdpConnection),
     Tcp(TcpConnection),
     TcpListener(TcpListenerConnection),
     #[cfg(feature = "rustls")]
@@ -165,7 +167,7 @@ pub enum SipConnection {
 impl SipConnection {
     pub fn transport(&self) -> Transport {
         match self {
-            SipConnection::Udp(_) => Transport::Udp,
+            SipConnection::Udp(_) | SipConnection::CustomUdp(_) => Transport::Udp,
             SipConnection::Tcp(_) | SipConnection::TcpListener(_) => Transport::Tcp,
             #[cfg(feature = "rustls")]
             SipConnection::Tls(_) | SipConnection::TlsListener(_) => Transport::Tls,
@@ -178,13 +180,14 @@ impl SipConnection {
     }
 
     pub fn is_reliable(&self) -> bool {
-        !matches!(self, SipConnection::Udp(_))
+        !matches!(self, SipConnection::Udp(_) | SipConnection::CustomUdp(_))
     }
 
     pub fn cancel_token(&self) -> Option<CancellationToken> {
         match self {
             SipConnection::Channel(transport) => transport.cancel_token(),
             SipConnection::Udp(transport) => transport.cancel_token(),
+            SipConnection::CustomUdp(transport) => transport.cancel_token(),
             SipConnection::Tcp(transport) => transport.cancel_token(),
             #[cfg(feature = "rustls")]
             SipConnection::Tls(transport) => transport.cancel_token(),
@@ -197,6 +200,7 @@ impl SipConnection {
         match self {
             SipConnection::Channel(transport) => transport.get_addr(),
             SipConnection::Udp(transport) => transport.get_addr(),
+            SipConnection::CustomUdp(transport) => transport.get_addr(),
             SipConnection::Tcp(transport) => transport.get_addr(),
             SipConnection::TcpListener(transport) => transport.get_addr(),
             #[cfg(feature = "rustls")]
@@ -214,6 +218,7 @@ impl SipConnection {
         match self {
             SipConnection::Channel(transport) => transport.get_remote_addr(),
             SipConnection::Udp(transport) => transport.get_remote_addr(),
+            SipConnection::CustomUdp(transport) => transport.get_remote_addr(),
             SipConnection::Tcp(transport) => Some(transport.get_remote_addr()),
             SipConnection::TcpListener(_) => None,
             #[cfg(feature = "rustls")]
@@ -231,6 +236,7 @@ impl SipConnection {
         match self {
             SipConnection::Channel(transport) => transport.send(msg).await,
             SipConnection::Udp(transport) => transport.send(msg, destination).await,
+            SipConnection::CustomUdp(transport) => transport.send(msg, destination).await,
             SipConnection::Tcp(transport) => transport.send_message(msg).await,
             SipConnection::TcpListener(_) => {
                 debug!("SipConnection::send: TcpListener cannot send messages");
@@ -256,6 +262,7 @@ impl SipConnection {
         match self {
             SipConnection::Channel(transport) => transport.serve_loop(sender).await,
             SipConnection::Udp(transport) => transport.serve_loop(sender).await,
+            SipConnection::CustomUdp(transport) => transport.serve_loop(sender).await,
             SipConnection::Tcp(transport) => transport.serve_loop(sender).await,
             SipConnection::TcpListener(_) => {
                 debug!("SipConnection::serve_loop: TcpListener does not have serve_loop");
@@ -282,6 +289,7 @@ impl SipConnection {
         match self {
             SipConnection::Channel(transport) => transport.close().await,
             SipConnection::Udp(_) => Ok(()), // UDP has no connection state
+            SipConnection::CustomUdp(_) => Ok(()),
             SipConnection::Tcp(transport) => transport.close().await,
             SipConnection::TcpListener(transport) => transport.close().await,
             #[cfg(feature = "rustls")]
@@ -441,6 +449,7 @@ impl fmt::Display for SipConnection {
         match self {
             SipConnection::Channel(t) => write!(f, "{}", t),
             SipConnection::Udp(t) => write!(f, "UDP {}", t),
+            SipConnection::CustomUdp(t) => write!(f, "UDP(custom) {}", t),
             SipConnection::Tcp(t) => write!(f, "TCP {}", t),
             SipConnection::TcpListener(t) => write!(f, "TCP LISTEN {}", t),
             #[cfg(feature = "rustls")]
@@ -464,6 +473,12 @@ impl From<ChannelConnection> for SipConnection {
 impl From<UdpConnection> for SipConnection {
     fn from(connection: UdpConnection) -> Self {
         SipConnection::Udp(connection)
+    }
+}
+
+impl From<CustomUdpConnection> for SipConnection {
+    fn from(connection: CustomUdpConnection) -> Self {
+        SipConnection::CustomUdp(connection)
     }
 }
 
